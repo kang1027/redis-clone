@@ -1,0 +1,10 @@
+/target
+
+# macOS
+.DS_Store
+
+# Redis 실행 산출물
+*.rdb
+*.aof
+appendonly.aof*
+dump.rdb
