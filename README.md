@@ -24,16 +24,21 @@ Rust를 몰라도 AI와 함께 구현하면서, **설계 결정과 그 근거를
 
 ## 로드맵
 
-| 세션 | 만들 것 | 같이 배울 Rust 개념 |
-| --- | --- | --- |
-| 1 | TCP 서버 + `PING` | `Result`와 `?`, `loop`, 소유권 첫 만남 |
-| 2 | RESP 파서 + `ECHO` + 파이프라인 | `enum` + `match`, `&[u8]`와 `Vec<u8>` |
-| 3 | `SET`/`GET`/`DEL`/`EXISTS` | `HashMap`, `Arc<Mutex>`, `.clone()`의 의미 |
-| 4 | TTL — `SET EX/PX`, `EXPIRE`, `TTL` | `async`/`.await`, 백그라운드 태스크 |
-| 5 | List / Hash / Set + `WRONGTYPE` | 데이터를 담는 `enum`, `impl` |
-| 6 | Sorted Set (skiplist 직접 구현) | borrow checker와 정면 승부 |
-| 7 | Pub/Sub + `MULTI`/`EXEC` | 채널, `tokio::select!` |
-| 8 | AOF 영속성 + `redis-benchmark` 비교 | 파일 I/O, 성능 회고 |
+| 세션 | 만들 것 | 백엔드에서 배우는 것 | 같이 배울 Rust 개념 |
+| --- | --- | --- | --- |
+| 1 | TCP 서버 + `PING` | accept 루프, 커넥션 단위 처리 | `Result`와 `?`, `loop`, 소유권 첫 만남 |
+| 2 | RESP 파서 + `ECHO` + 파이프라인 | 길이 기반 프로토콜, 파이프라이닝 | `enum` + `match`, `&[u8]`와 `Vec<u8>` |
+| 3 | `SET`/`GET`/`DEL`/`EXISTS` | 공유 저장소, cache-aside 패턴 | `HashMap`, `Arc<Mutex>`, `.clone()`의 의미 |
+| 4 | TTL — `EXPIRE`/`TTL`/`PERSIST`, `SET NX EX` | 만료 전략(lazy vs active), 분산 락 | `Instant`/`Duration`, 백그라운드 태스크 |
+| 5 | `INCR`/`DECR`/`INCRBY` | 원자성, rate limiter, 카운터 | 정수 파싱, `checked_add` |
+| 6 | List — `LPUSH`/`LPOP`/`LRANGE` + `WRONGTYPE` | 작업 큐의 자료구조 | 데이터를 담는 `enum`, `VecDeque` |
+| 7 | `BLPOP`/`BRPOP` (블로킹) | 클라이언트를 재우고 깨우기, 폴링과의 차이 | 채널, `tokio::select!`, `Notify` |
+| 8 | Hash — `HSET`/`HGETALL`/`HINCRBY` | 세션 저장, 부분 갱신 | 중첩 자료구조의 소유권 |
+| 9 | `MULTI`/`EXEC`/`DISCARD`/`WATCH` | 낙관적 락(CAS), 롤백이 없는 이유 | 커넥션별 상태, 키 버전 추적 |
+| 10 | `KEYS` vs `SCAN` + `TYPE`/`DBSIZE` | O(N) 명령이 서버를 멈추는 이유, 커서 순회 | 반복자, 패턴 매칭 직접 구현 |
+
+Set / Sorted Set / Pub/Sub / 영속성은 10세션을 끝낸 뒤 확장으로 다룹니다.
+세션별 상세(실무 사용 예, 설계 토론 항목, 완료 기준)는 [docs/backend-roadmap.md](docs/backend-roadmap.md)에 있습니다.
 
 세션마다 GitHub Issue가 하나씩 있습니다. 설계 토론은 그 Issue에서 합니다.
 
