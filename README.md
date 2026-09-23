@@ -35,10 +35,17 @@ sudo apt-get install -y redis-server redis-tools gh
 
 ```bash
 # 설치 확인 — 셋 다 버전이 찍혀야 합니다
-redis-server --version
+redis-server --version    # 8.x 여야 합니다 (아래 주의 참고)
 redis-cli --version
 cargo --version           # 1.98 이상
 ```
+
+> **정답지 Redis 버전을 맞추세요.** 에러 문구가 버전에 따라 다릅니다.
+> 예를 들어 인자 없는 모르는 커맨드에 Redis 7은
+> `ERR unknown command 'garbage', with args beginning with: `를,
+> Redis 8은 `ERR unknown command 'garbage'`를 돌려줍니다.
+> 버전이 다르면 **같은 코드가 내 컴퓨터에서는 통과하고 남의 컴퓨터에서는 실패합니다.**
+> CI는 `redis:8.2`로 고정되어 있습니다.
 
 > `brew services start redis`는 **하지 않아도 됩니다.** 테스트 러너가 필요할 때 알아서 띄웁니다.
 

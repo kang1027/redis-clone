@@ -25,10 +25,19 @@ jobs:
   difftest:
     name: 진짜 Redis와 응답 비교
     runs-on: ubuntu-latest
+    # 정답지 Redis의 버전을 고정합니다.
+    # apt 로 설치하면 러너마다 버전이 달라지고, 에러 문구가 버전에 따라 달라서
+    # 같은 코드가 로컬에서는 통과하고 CI에서는 실패합니다. (실제로 겪었습니다)
+    # difftest.sh 는 6379가 이미 떠 있으면 그걸 정답지로 씁니다.
+    services:
+      redis:
+        image: redis:8.2
+        ports:
+          - 6379:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Redis 설치
-        run: sudo apt-get update && sudo apt-get install -y redis-server redis-tools
+      - name: redis-cli 설치
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
       - run: ./scripts/difftest.sh
