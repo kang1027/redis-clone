@@ -35,10 +35,21 @@ sudo apt-get install -y redis-server redis-tools gh
 
 ```bash
 # 설치 확인 — 셋 다 버전이 찍혀야 합니다
-redis-server --version
+redis-server --version    # 8.x 여야 합니다 (아래 주의 참고)
 redis-cli --version
 cargo --version           # 1.98 이상
 ```
+
+> **정답지 Redis 버전을 맞추세요.** 에러 문구가 버전에 따라 다릅니다.
+> 인자 없는 모르는 커맨드 하나만 봐도 이렇습니다.
+>
+> | 버전 | 응답 |
+> | --- | --- |
+> | 7.x, 8.2 | `ERR unknown command 'garbage', with args beginning with: ` |
+> | 8.10 | `ERR unknown command 'garbage'` |
+>
+> 버전이 다르면 **같은 코드가 내 컴퓨터에서는 통과하고 남의 컴퓨터에서는 실패합니다.**
+> CI는 `redis:8.10.2`로 고정되어 있습니다. 로컬도 8.10.x 로 맞추세요 (`brew upgrade redis`).
 
 > `brew services start redis`는 **하지 않아도 됩니다.** 테스트 러너가 필요할 때 알아서 띄웁니다.
 
@@ -334,7 +345,8 @@ printf 'garbage\r\n' | nc localhost 6380
 redis-cli -p 6380 PING        # 여전히 PONG 이어야 함
 
 # 명령을 쪼개서 보내도 처리되어야 합니다
-exec 3<>/dev/tcp/localhost/6380; printf '*1\r\n$4\r\n' >&3; sleep 1; printf 'PING\r\n' >&3; head -c 7 <&3
+# (macOS 기본 셸 zsh에는 /dev/tcp 가 없어서 bash 로 감쌉니다)
+bash -c 'exec 3<>/dev/tcp/localhost/6380; printf "*1\r\n\$4\r\n" >&3; sleep 1; printf "PING\r\n" >&3; head -c 7 <&3'
 ```
 
 ---

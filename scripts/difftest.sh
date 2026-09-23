@@ -32,7 +32,8 @@ need() {
   command -v "$1" >/dev/null 2>&1 || { echo "❌ '$1' 이(가) 없습니다. brew install redis 를 실행하세요."; exit 1; }
 }
 need redis-cli
-need redis-server
+# redis-server 는 우리가 직접 정답지를 띄워야 할 때만 필요합니다.
+# 이미 떠 있는 Redis(예: CI의 서비스 컨테이너)를 쓸 때는 redis-cli 만 있으면 됩니다.
 
 wait_for_port() {
   local port="$1" name="$2" i
@@ -48,6 +49,7 @@ wait_for_port() {
 if redis-cli -p "$REF_PORT" PING >/dev/null 2>&1; then
   echo "▶ 이미 떠 있는 Redis를 정답지로 사용합니다 (포트 $REF_PORT)"
 else
+  need redis-server
   echo "▶ 정답지 Redis를 띄웁니다 (포트 $REF_PORT)"
   redis-server --port "$REF_PORT" --save '' --appendonly no --daemonize no >/dev/null 2>&1 &
   ref_pid=$!
