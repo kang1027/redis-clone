@@ -73,27 +73,22 @@ fn handle_connection(mut stream: TcpStream) {
         };
         buffer.extend_from_slice(&chunk[..read]);
 
-        // 한 번 읽은 버퍼에 명령이 여러 개 들어 있을 수 있습니다 (파이프라이닝).
-        loop {
-            let (command, consumed) = match parse_command(&buffer) {
-                Parsed::Complete(command, consumed) => (command, consumed),
-                Parsed::Incomplete => break, // 뒷부분이 아직 안 왔습니다. 더 읽습니다
-                Parsed::Broken => {
-                    let _ = stream.write_all(&error_reply(b"ERR Protocol error"));
-                    return; // 프로토콜이 깨지면 진짜 Redis도 연결을 끊습니다
-                }
-            };
+        let (command, consumed) = match parse_command(&buffer) {
+            Parsed::Complete(command, consumed) => (command, consumed),
+            Parsed::Incomplete => continue, // 뒷부분이 아직 안 왔습니다. 더 읽습니다
+            // 형식이 깨지면 연결을 끊습니다. 진짜 Redis는 구체적인 문구도 함께 보내는데,
+            // 그건 파서를 제대로 만드는 S2에서 맞춥니다.
+            Parsed::Broken => return,
+        };
+        buffer.drain(..consumed);
 
-            buffer.drain(..consumed);
-
-            let reply = build_reply(&command);
-            if reply.is_empty() {
-                continue;
-            }
-            if let Err(error) = stream.write_all(&reply) {
-                eprintln!("쓰지 못했습니다: {error}");
-                return;
-            }
+        let reply = build_reply(&command);
+        if reply.is_empty() {
+            continue;
+        }
+        if let Err(error) = stream.write_all(&reply) {
+            eprintln!("쓰지 못했습니다: {error}");
+            return;
         }
     }
 }
@@ -108,30 +103,14 @@ enum Parsed {
     Broken,
 }
 
+/// redis-cli 는 명령을 RESP 배열로 보냅니다: `*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n`
+/// 진짜 Redis는 `nc` 로 친 생 텍스트(인라인 명령)도 받아주는데, 그건 S2 몫입니다.
 fn parse_command(buffer: &[u8]) -> Parsed {
     match buffer.first() {
         None => Parsed::Incomplete,
-        // redis-cli 는 RESP 배열로 보냅니다: *2\r\n$4\r\nPING\r\n$5\r\nhello\r\n
         Some(b'*') => parse_array(buffer),
-        // nc 나 telnet 으로 그냥 친 줄(인라인 명령)도 진짜 Redis는 받아줍니다.
-        Some(_) => parse_inline(buffer),
+        Some(_) => Parsed::Broken,
     }
-}
-
-fn parse_inline(buffer: &[u8]) -> Parsed {
-    let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
-        return Parsed::Incomplete;
-    };
-
-    let line = &buffer[..end];
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let parts = line
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_vec())
-        .collect();
-
-    Parsed::Complete(parts, end + 1)
 }
 
 fn parse_array(buffer: &[u8]) -> Parsed {
@@ -257,22 +236,6 @@ mod tests {
             parse_command(b"*2\r\n$4\r\nPING\r\n$5\r\nhel"),
             Parsed::Incomplete
         ));
-    }
-
-    #[test]
-    fn 버퍼에_명령이_둘이면_앞의_것만_꺼낸다() {
-        let buffer = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
-        let (_, consumed) = complete(buffer);
-        assert_eq!(consumed, 14);
-        let (command, _) = complete(&buffer[consumed..]);
-        assert_eq!(command, vec![b"PING".to_vec()]);
-    }
-
-    #[test]
-    fn 인라인_명령도_받는다() {
-        let (command, consumed) = complete(b"PING hello\r\n");
-        assert_eq!(command, vec![b"PING".to_vec(), b"hello".to_vec()]);
-        assert_eq!(consumed, 12);
     }
 
     #[test]
