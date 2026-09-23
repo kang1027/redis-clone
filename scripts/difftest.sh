@@ -3,7 +3,9 @@
 # 진짜 Redis(정답지)와 우리 구현의 응답을 한 줄씩 비교합니다.
 #
 #   ./scripts/difftest.sh                  # tests/cases/ 전체 실행
-#   ./scripts/difftest.sh tests/cases/01-ping.txt   # 특정 파일만 실행
+#   ./scripts/difftest.sh 01               # 이름에 01 이 들어간 케이스만 (01-ping.txt)
+#   ./scripts/difftest.sh ping             # 이름에 ping 이 들어간 케이스만
+#   ./scripts/difftest.sh tests/cases/01-ping.txt   # 경로를 직접 줘도 됩니다
 #
 # 케이스 파일 규칙
 #   - 한 줄에 커맨드 하나. 인자는 공백으로 구분 (따옴표는 지원하지 않습니다)
@@ -68,9 +70,40 @@ wait_for_port "$OUR_PORT" "우리" || {
 }
 
 # --- 비교 실행 -----------------------------------------------------------
-files=("$@")
-if [ ${#files[@]} -eq 0 ]; then
+# 인자는 파일 경로여도 되고, 케이스 이름의 일부여도 됩니다. (예: 01, ping, 01-ping)
+resolve_case() {
+  local given="$1" matches=()
+  if [ -f "$given" ]; then
+    echo "$given"
+    return 0
+  fi
+  for candidate in "$ROOT"/tests/cases/*"$given"*.txt; do
+    [ -f "$candidate" ] && matches+=("$candidate")
+  done
+  if [ ${#matches[@]} -eq 0 ]; then
+    echo "❌ '$given' 에 맞는 케이스 파일이 없습니다. 있는 것:" >&2
+    for candidate in "$ROOT"/tests/cases/*.txt; do
+      [ -f "$candidate" ] && echo "   - $(basename "$candidate")" >&2
+    done
+    return 1
+  fi
+  printf '%s\n' "${matches[@]}"
+}
+
+files=()
+if [ $# -eq 0 ]; then
   files=("$ROOT"/tests/cases/*.txt)
+else
+  for given in "$@"; do
+    while IFS= read -r resolved; do
+      files+=("$resolved")
+    done < <(resolve_case "$given") || exit 1
+  done
+fi
+
+if [ ${#files[@]} -eq 0 ]; then
+  echo "❌ 실행할 케이스 파일이 없습니다."
+  exit 1
 fi
 
 pass=0

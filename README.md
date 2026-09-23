@@ -127,9 +127,14 @@ redis-cli -p 6379 PING            # → PONG
 에러 메시지 문구까지 똑같아야 통과입니다.
 
 ```bash
-./scripts/difftest.sh                          # 전체
-./scripts/difftest.sh tests/cases/01-ping.txt  # 이번 세션 것만
+./scripts/difftest.sh          # 전체
+./scripts/difftest.sh 01       # 이름에 01 이 들어간 케이스만 (01-ping.txt)
+./scripts/difftest.sh ping     # 이름에 ping 이 들어간 케이스만
 ```
+
+`tests/cases/`에는 **이미 끝난 세션의 케이스만** 둡니다.
+그래야 전체 실행이 항상 초록불이고, 새 기능이 예전 걸 깨뜨렸을 때 바로 걸립니다.
+이번 세션 케이스 파일은 각자 만들어서 당번 PR로 main에 들어갑니다.
 
 ---
 
