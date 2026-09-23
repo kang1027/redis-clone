@@ -334,7 +334,8 @@ printf 'garbage\r\n' | nc localhost 6380
 redis-cli -p 6380 PING        # 여전히 PONG 이어야 함
 
 # 명령을 쪼개서 보내도 처리되어야 합니다
-exec 3<>/dev/tcp/localhost/6380; printf '*1\r\n$4\r\n' >&3; sleep 1; printf 'PING\r\n' >&3; head -c 7 <&3
+# (macOS 기본 셸 zsh에는 /dev/tcp 가 없어서 bash 로 감쌉니다)
+bash -c 'exec 3<>/dev/tcp/localhost/6380; printf "*1\r\n\$4\r\n" >&3; sleep 1; printf "PING\r\n" >&3; head -c 7 <&3'
 ```
 
 ---
