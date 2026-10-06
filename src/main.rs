@@ -73,22 +73,24 @@ fn handle_connection(mut stream: TcpStream) {
         };
         buffer.extend_from_slice(&chunk[..read]);
 
-        let (command, consumed) = match parse_command(&buffer) {
-            Parsed::Complete(command, consumed) => (command, consumed),
-            Parsed::Incomplete => continue, // 뒷부분이 아직 안 왔습니다. 더 읽습니다
-            // 형식이 깨지면 연결을 끊습니다. 진짜 Redis는 구체적인 문구도 함께 보내는데,
-            // 그건 파서를 제대로 만드는 S2에서 맞춥니다.
-            Parsed::Broken => return,
-        };
-        buffer.drain(..consumed);
+        loop {
+            let (command, consumed) = match parse_command(&buffer) {
+                Parsed::Complete(command, consumed) => (command, consumed),
+                Parsed::Incomplete => break, // 뒷부분이 아직 안 왔습니다. 더 읽습니다
+                // 형식이 깨지면 연결을 끊습니다. 진짜 Redis는 구체적인 문구도 함께 보내는데,
+                // 그건 파서를 제대로 만드는 S2에서 맞춥니다.
+                Parsed::Broken => return,
+            };
+            buffer.drain(..consumed);
 
-        let reply = build_reply(&command);
-        if reply.is_empty() {
-            continue;
-        }
-        if let Err(error) = stream.write_all(&reply) {
-            eprintln!("쓰지 못했습니다: {error}");
-            return;
+            let reply = build_reply(&command);
+            if reply.is_empty() {
+                continue;
+            }
+            if let Err(error) = stream.write_all(&reply) {
+                eprintln!("쓰지 못했습니다: {error}");
+                return;
+            }
         }
     }
 }
@@ -175,6 +177,13 @@ fn build_reply(command: &[Vec<u8>]) -> Vec<u8> {
             1 => b"+PONG\r\n".to_vec(),
             2 => bulk_string(&command[1]),
             _ => error_reply(b"ERR wrong number of arguments for 'ping' command"),
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"ECHO") {
+        return match command.len() {
+            2 => bulk_string(&command[1]),
+            _ => error_reply(b"ERR wrong number of arguments for 'echo' command"),
         };
     }
 
@@ -266,6 +275,29 @@ mod tests {
         assert_eq!(
             build_reply(&[b"foo".to_vec(), b"a".to_vec(), b"b".to_vec()]),
             b"-ERR unknown command 'foo', with args beginning with: 'a' 'b' \r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn echo_응답이_진짜_redis와_같다() {
+        assert_eq!(
+            build_reply(&[b"ECHO".to_vec(), b"hello".to_vec()]),
+            b"$5\r\nhello\r\n".to_vec()
+        );
+
+        assert_eq!(
+            build_reply(&[b"echo".to_vec(), "한글".as_bytes().to_vec()]),
+            "$6\r\n한글\r\n".as_bytes().to_vec()
+        );
+
+        assert_eq!(
+            build_reply(&[b"ECHO".to_vec()]),
+            b"-ERR wrong number of arguments for 'echo' command\r\n".to_vec()
+        );
+
+        assert_eq!(
+            build_reply(&[b"ECHO".to_vec(), b"a".to_vec(), b"b".to_vec()]),
+            b"-ERR wrong number of arguments for 'echo' command\r\n".to_vec()
         );
     }
 }
