@@ -1,12 +1,15 @@
 mod command;
 mod connection;
+mod db;
 mod reply;
 mod resp;
 
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::thread;
 
 use connection::Connection;
+use db::Db;
 
 /// 진짜 Redis가 6379를 쓰기 때문에 우리는 6380을 씁니다.
 const DEFAULT_PORT: u16 = 6380;
@@ -29,11 +32,17 @@ fn main() {
     };
     eprintln!("포트 {port} 에서 연결을 기다립니다");
 
+    // 저장소는 서버에 하나만 있습니다.
+    // 스레드는 main보다 오래 살 수 있어서 `&db`(빌림)를 넘길 수 없습니다. 그래서 `Arc`로 같이 소유합니다.
+    let db = Arc::new(Db::default());
+
     for incoming in listener.incoming() {
         match incoming {
             // 커넥션 하나당 스레드 하나. 한 커넥션이 막혀도 다른 커넥션은 계속 처리됩니다.
             Ok(stream) => {
-                thread::spawn(move || Connection::new(stream).run());
+                // `Arc::clone`은 저장소를 복사하지 않습니다. 가리키는 쪽이 하나 늘었다는 숫자만 올립니다.
+                let db = Arc::clone(&db);
+                thread::spawn(move || Connection::new(stream, db).run());
             }
             // 연결 하나를 못 받았다고 서버를 끄지 않습니다.
             Err(error) => eprintln!("연결을 수락하지 못했습니다: {error}"),

@@ -2,8 +2,10 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 
 use crate::command::build_reply;
+use crate::db::Db;
 use crate::reply::error_reply;
 use crate::resp::{Parsed, parse_command};
 
@@ -13,13 +15,16 @@ pub struct Connection {
     // 읽은 바이트를 모아두는 버퍼입니다.
     // TCP는 메시지 단위가 아니라 바이트 흐름이라, 명령 하나가 여러 번에 나눠 도착할 수 있습니다.
     buffer: Vec<u8>,
+    // 모든 커넥션이 같은 저장소 하나를 가리킵니다. 커넥션마다 따로 두면 다른 커넥션의 SET이 안 보입니다.
+    db: Arc<Db>,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, db: Arc<Db>) -> Self {
         Connection {
             stream,
             buffer: Vec::new(),
+            db,
         }
     }
 
@@ -68,7 +73,7 @@ impl Connection {
             match parse_command(&self.buffer[cursor..]) {
                 Parsed::Complete(command, consumed) => {
                     cursor += consumed;
-                    replies.extend_from_slice(&build_reply(&command));
+                    replies.extend_from_slice(&build_reply(command, &self.db));
                 }
                 // 뒷부분이 아직 안 왔습니다. 더 읽습니다.
                 Parsed::Incomplete => break,
