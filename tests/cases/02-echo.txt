@@ -1,0 +1,20 @@
+# 세션 2: ECHO
+# difftest 는 redis-cli 를 거치므로 항상 RESP 배열로 전송됩니다.
+# 인라인 명령과 프로토콜 에러는 여기서 검사할 수 없습니다 (raw 소켓이 필요).
+
+ECHO hello
+echo hello
+ECHO 123
+
+# PING 과 다릅니다. PING hello 는 정상이지만 ECHO 는 인자가 정확히 하나여야 합니다
+ECHO
+ECHO a b
+ECHO a b c
+
+# 바이트 길이로 응답해야 합니다 ($6 이지 $2 가 아닙니다)
+ECHO 한글
+
+# ECHO 를 추가해도 S01 동작이 깨지지 않아야 합니다
+PING
+PING hello
+NOPE a b
