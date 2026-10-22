@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::command::build_reply;
 use crate::db::Db;
@@ -73,7 +74,8 @@ impl Connection {
             match parse_command(&self.buffer[cursor..]) {
                 Parsed::Complete(command, consumed) => {
                     cursor += consumed;
-                    replies.extend_from_slice(&build_reply(command, &self.db));
+                    // 시각은 명령마다 한 번 잽니다. 진짜 Redis도 명령 하나 안에서는 같은 시각을 씁니다.
+                    replies.extend_from_slice(&build_reply(command, &self.db, Instant::now()));
                 }
                 // 뒷부분이 아직 안 왔습니다. 더 읽습니다.
                 Parsed::Incomplete => break,

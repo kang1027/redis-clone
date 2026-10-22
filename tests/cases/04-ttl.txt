@@ -1,0 +1,106 @@
+# 세션 4: EXPIRE / TTL / PERSIST / SET 옵션(EX, PX, NX, XX) / DBSIZE
+#
+# 주의 1: TTL은 남은 시간을 초로 반올림합니다(99.989초 → 100). SLEEP 바로 뒤에 TTL을 찍으면
+#         남은 시간이 x.5초 근처라 두 서버가 몇 ms 차이로 갈릴 수 있습니다.
+#         그래서 TTL은 걸자마자만 확인하고, SLEEP은 키를 만료시키는 데만 씁니다.
+# 주의 2: redis-cli 출력을 비교하므로 SET NX 실패(nil, $-1)와 빈 문자열, 정수와 문자열이 구분되지 않습니다.
+#         바이트 단위 검사는 src/command.rs 의 단위 테스트에 있습니다.
+
+# TTL 없는 키는 -1, 없는 키는 -2
+SET k v
+TTL k
+TTL nope
+
+# EX는 초, PX는 밀리초
+SET k v EX 100
+TTL k
+SET p v PX 50000
+TTL p
+
+# 옵션 없이 SET하면 걸려 있던 TTL이 지워집니다
+SET k v
+TTL k
+
+# EXPIRE는 있는 키에만 1, PERSIST는 TTL이 있을 때만 1
+EXPIRE k 100
+TTL k
+EXPIRE nope 100
+PERSIST k
+PERSIST k
+TTL k
+PERSIST nope
+
+# EXPIRE를 다시 걸면 짧아지더라도 덮어씁니다
+EXPIRE k 1000
+EXPIRE k 50
+TTL k
+
+# 0이나 음수로 EXPIRE하면 바로 지워집니다 (SET의 EX 0은 에러인 것과 다릅니다)
+EXPIRE k 0
+EXISTS k
+SET k v
+EXPIRE k -5
+GET k
+EXPIRE nope -5
+
+# NX는 없을 때만, XX는 있을 때만 씁니다. 못 쓰면 nil입니다. NX + EX가 분산 락입니다
+SET lock owner1 NX EX 30
+SET lock owner2 NX EX 30
+GET lock
+SET nope v XX
+GET nope
+SET lock owner3 XX
+GET lock
+TTL lock
+
+# 옵션은 대소문자와 순서를 가리지 않고, 같은 옵션을 또 쓰면 뒤의 것이 이깁니다
+SET k v nx ex 10
+TTL k
+SET k v EX 10 EX 20
+TTL k
+SET k v XX PX 30000
+TTL k
+
+# 만료된 키는 GET, EXISTS, TTL, DEL, SET NX 어디서 봐도 없는 키입니다
+SET short v PX 100
+SLEEP 0.3
+GET short
+EXISTS short
+TTL short
+DEL short
+SET short again NX
+GET short
+
+# 문법 에러가 숫자 에러보다 먼저입니다
+SET k v NX XX
+SET k v EX 10 PX 100
+SET k v EX
+SET k v EX abc NX XX
+SET k v foo
+SET k v EX abc
+SET k v EX 1.5
+SET k v EX +10
+SET k v EX 0
+SET k v EX -1
+SET k v PX 0
+EXPIRE k
+EXPIRE k abc
+EXPIRE k 010
+EXPIRE k 9999999999999999
+EXPIRE k abc foo
+TTL
+TTL a b
+PERSIST
+PERSIST a b
+DBSIZE x
+
+# DBSIZE: 아무도 안 읽은 만료 키도 결국 사라집니다 (active expiration)
+# 앞에서 TTL을 건 키가 섞이지 않게 먼저 지웁니다
+DEL k p lock short
+SET a v PX 500
+SET b v PX 500
+SET c v
+DBSIZE
+SLEEP 1.2
+DBSIZE
+DEL c

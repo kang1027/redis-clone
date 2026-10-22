@@ -54,3 +54,6 @@ SET k v foo
 # S01, S02 가 깨지지 않았는지
 PING
 ECHO hello
+
+# 이 파일이 남긴 키를 지웁니다. 우리 서버는 FLUSHALL이 없어서, 남겨 두면 다음 파일의 DBSIZE가 깨집니다
+DEL 한글

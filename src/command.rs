@@ -1,6 +1,8 @@
 //! 파싱된 명령(인자 목록)을 커맨드로 바꾸고, 실행해서 응답 바이트를 만듭니다.
 
-use crate::db::Db;
+use std::time::{Duration, Instant};
+
+use crate::db::{Db, Entry};
 use crate::reply::{bulk_string, error_reply, integer, null_bulk_string};
 
 /// 인자 개수 검사를 통과한 커맨드입니다.
@@ -12,6 +14,9 @@ enum Command {
     Set {
         key: Vec<u8>,
         value: Vec<u8>,
+        condition: Option<SetCondition>,
+        /// `EX`/`PX`가 없으면 None입니다. 그래도 덮어쓰므로 걸려 있던 TTL은 지워집니다.
+        expires_at: Option<Instant>,
     },
     Get {
         key: Vec<u8>,
@@ -20,6 +25,34 @@ enum Command {
     Del(Vec<Vec<u8>>),
     /// 키가 하나 이상 들어 있습니다.
     Exists(Vec<Vec<u8>>),
+    /// `at`이 `now`보다 앞이거나 같으면 TTL을 거는 대신 키를 바로 지웁니다.
+    Expire {
+        key: Vec<u8>,
+        at: Instant,
+    },
+    Ttl {
+        key: Vec<u8>,
+    },
+    Persist {
+        key: Vec<u8>,
+    },
+    DbSize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SetCondition {
+    /// `NX`: 키가 없을 때만 씁니다.
+    Nx,
+    /// `XX`: 키가 있을 때만 씁니다.
+    Xx,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TimeUnit {
+    /// `EX`
+    Seconds,
+    /// `PX`
+    Millis,
 }
 
 /// 커맨드 단계의 에러입니다. 프로토콜 에러와 달리 응답만 보내고 연결은 유지합니다.
@@ -30,26 +63,32 @@ enum CommandError {
     },
     /// 문구에는 사용자가 친 대소문자와 상관없이 소문자 이름이 들어갑니다.
     WrongArity(&'static str),
-    /// 모르는 옵션입니다. 지금은 `SET k v` 뒤에 뭐가 붙으면 전부 여기로 옵니다.
+    /// `SET`의 모르는 옵션이나 같이 쓸 수 없는 옵션(`NX XX`, `EX PX`)입니다.
     Syntax,
+    NotInteger,
+    /// 이름이 들어가는 자리는 `'set'`, `'expire'`처럼 소문자입니다.
+    InvalidExpireTime(&'static str),
+    /// `EXPIRE` 뒤에 붙은 옵션입니다. 옵션(NX/XX/GT/LT)은 이번 범위가 아니라 전부 여기로 옵니다.
+    UnsupportedOption(Vec<u8>),
 }
 
-pub fn build_reply(command: Vec<Vec<u8>>, db: &Db) -> Vec<u8> {
+/// `now`는 이 명령을 처리하는 시각입니다. 테스트는 여기에 "200초 뒤"를 넘겨서 sleep 없이 만료를 확인합니다.
+pub fn build_reply(command: Vec<Vec<u8>>, db: &Db, now: Instant) -> Vec<u8> {
     let mut parts = command.into_iter();
     // 빈 배열(`*0\r\n`)이나 빈 인라인 줄에는 진짜 Redis도 아무 응답을 하지 않습니다.
     let Some(name) = parts.next() else {
         return Vec::new();
     };
 
-    match Command::parse(name, parts.collect()) {
-        Ok(command) => command.execute(db),
+    match Command::parse(name, parts.collect(), now) {
+        Ok(command) => command.execute(db, now),
         Err(error) => error_reply(&error.message()),
     }
 }
 
 impl Command {
-    /// 인자 개수는 여기서 전부 확인합니다. 그래서 `execute`는 실패하지 않습니다.
-    fn parse(name: Vec<u8>, args: Vec<Vec<u8>>) -> Result<Command, CommandError> {
+    /// 인자 개수, 옵션 문법, 숫자는 여기서 전부 확인합니다. 그래서 `execute`는 실패하지 않습니다.
+    fn parse(name: Vec<u8>, args: Vec<Vec<u8>>, now: Instant) -> Result<Command, CommandError> {
         match name.to_ascii_uppercase().as_slice() {
             b"PING" => {
                 if args.len() > 1 {
@@ -64,13 +103,14 @@ impl Command {
                 Ok([message]) => Ok(Command::Echo(message)),
                 Err(_) => Err(CommandError::WrongArity("echo")),
             },
-            b"SET" => match <[Vec<u8>; 2]>::try_from(args) {
-                Ok([key, value]) => Ok(Command::Set { key, value }),
-                // 키와 값 뒤에 남는 인자는 옵션 자리입니다. 옵션(EX, NX 등)은 S04라서 지금은 전부 모르는 옵션입니다.
-                // `try_from`이 실패하면 원래 Vec을 그대로 돌려주므로 길이를 다시 볼 수 있습니다.
-                Err(args) if args.len() > 2 => Err(CommandError::Syntax),
-                Err(_) => Err(CommandError::WrongArity("set")),
-            },
+            b"SET" => {
+                let mut args = args.into_iter();
+                let (Some(key), Some(value)) = (args.next(), args.next()) else {
+                    return Err(CommandError::WrongArity("set"));
+                };
+                // 키와 값 뒤에 남은 인자는 전부 옵션 자리입니다.
+                parse_set(key, value, args, now)
+            }
             b"GET" => match <[Vec<u8>; 1]>::try_from(args) {
                 Ok([key]) => Ok(Command::Get { key }),
                 Err(_) => Err(CommandError::WrongArity("get")),
@@ -87,26 +127,76 @@ impl Command {
                 }
                 Ok(Command::Exists(args))
             }
+            b"EXPIRE" => {
+                let mut args = args.into_iter();
+                let (Some(key), Some(seconds)) = (args.next(), args.next()) else {
+                    return Err(CommandError::WrongArity("expire"));
+                };
+                // 진짜 Redis는 숫자보다 옵션을 먼저 봅니다. (`EXPIRE k abc foo` → Unsupported option foo)
+                if let Some(option) = args.next() {
+                    return Err(CommandError::UnsupportedOption(option));
+                }
+                let seconds = parse_integer(&seconds).ok_or(CommandError::NotInteger)?;
+                // SET의 EX와 달리 0이나 음수도 받습니다. 그때 `after_millis`는 `now`를 돌려줘서 바로 만료됩니다.
+                // 초를 밀리초로 바꾸다 i64를 넘치면(`checked_mul`이 None) 진짜 Redis도 invalid expire time입니다.
+                let at = seconds
+                    .checked_mul(1000)
+                    .and_then(|millis| after_millis(now, millis))
+                    .ok_or(CommandError::InvalidExpireTime("expire"))?;
+                Ok(Command::Expire { key, at })
+            }
+            b"TTL" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::Ttl { key }),
+                Err(_) => Err(CommandError::WrongArity("ttl")),
+            },
+            b"PERSIST" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::Persist { key }),
+                Err(_) => Err(CommandError::WrongArity("persist")),
+            },
+            b"DBSIZE" => {
+                if !args.is_empty() {
+                    return Err(CommandError::WrongArity("dbsize"));
+                }
+                Ok(Command::DbSize)
+            }
             _ => Err(CommandError::Unknown { name, args }),
         }
     }
 
     /// 저장소가 필요한 커맨드만 락을 잡습니다. 락은 각 갈래 안의 `entries`가 사라질 때 풀립니다.
-    fn execute(self, db: &Db) -> Vec<u8> {
+    /// 키를 읽을 때는 항상 `live`를 거칩니다. 만료된 키는 거기서 지워지고 없는 키로 보입니다.
+    fn execute(self, db: &Db, now: Instant) -> Vec<u8> {
         match self {
             Command::Ping(None) => b"+PONG\r\n".to_vec(),
             Command::Ping(Some(message)) => bulk_string(&message),
             Command::Echo(message) => bulk_string(&message),
-            Command::Set { key, value } => {
-                // key와 value를 복사하지 않고 저장소로 옮깁니다. 있던 값은 덮어씁니다.
-                db.lock().insert(key, value);
+            Command::Set {
+                key,
+                value,
+                condition,
+                expires_at,
+            } => {
+                let mut entries = db.lock();
+                // 있는지 보기와 쓰기가 락 한 번 안에서 끝납니다. 그 사이에 다른 커넥션이 끼어들 수 없어서
+                // `SET lock v NX`가 "먼저 온 한 명만 성공"하는 락이 됩니다.
+                let exists = entries.live(&key, now).is_some();
+                let allowed = match condition {
+                    None => true,
+                    Some(SetCondition::Nx) => !exists,
+                    Some(SetCondition::Xx) => exists,
+                };
+                if !allowed {
+                    return null_bulk_string();
+                }
+                // key와 value를 복사하지 않고 저장소로 옮깁니다. 있던 값과 TTL은 통째로 바뀝니다.
+                entries.insert(key, Entry { value, expires_at });
                 b"+OK\r\n".to_vec()
             }
             Command::Get { key } => {
-                let entries = db.lock();
+                let mut entries = db.lock();
                 // 값을 저장소 밖으로 복사해 꺼내지 않고, 락을 잡은 채 바로 응답 바이트로 씁니다.
-                match entries.get(&key) {
-                    Some(value) => bulk_string(value),
+                match entries.live(&key, now) {
+                    Some(entry) => bulk_string(&entry.value),
                     None => null_bulk_string(),
                 }
             }
@@ -115,25 +205,134 @@ impl Command {
                 let mut deleted = 0;
                 // 같은 키가 두 번 오면 두 번째에는 이미 지워져 있어서 세지 않습니다. (`DEL k k` → 1)
                 for key in &keys {
-                    if entries.remove(key).is_some() {
+                    if entries.remove(key, now) {
                         deleted += 1;
                     }
                 }
                 integer(deleted)
             }
             Command::Exists(keys) => {
-                let entries = db.lock();
+                let mut entries = db.lock();
                 let mut found = 0;
                 // DEL과 달리 같은 키가 여러 번 오면 그만큼 셉니다. (`EXISTS k k` → 2)
                 for key in &keys {
-                    if entries.contains_key(key) {
+                    if entries.live(key, now).is_some() {
                         found += 1;
                     }
                 }
                 integer(found)
             }
+            Command::Expire { key, at } => {
+                let mut entries = db.lock();
+                // 이미 지난 시각이면 TTL을 거는 대신 바로 지웁니다. 키가 있었으면 1입니다. (`EXPIRE k 0` → 1)
+                if at <= now {
+                    return integer(i64::from(entries.remove(&key, now)));
+                }
+                match entries.live(&key, now) {
+                    Some(entry) => {
+                        entry.expires_at = Some(at);
+                        integer(1)
+                    }
+                    None => integer(0),
+                }
+            }
+            Command::Ttl { key } => {
+                let mut entries = db.lock();
+                // 바깥 Option은 키가 있는지, 안쪽 Option은 TTL이 걸려 있는지입니다.
+                match entries.live(&key, now).map(|entry| entry.expires_at) {
+                    None => integer(-2),
+                    Some(None) => integer(-1),
+                    Some(Some(at)) => {
+                        // 진짜 Redis처럼 초 단위로 반올림합니다. 99.989초 남았으면 99가 아니라 100입니다.
+                        let millis = at.saturating_duration_since(now).as_millis();
+                        integer(i64::try_from((millis + 500) / 1000).unwrap_or(i64::MAX))
+                    }
+                }
+            }
+            Command::Persist { key } => {
+                let mut entries = db.lock();
+                match entries.live(&key, now) {
+                    // `take`는 TTL을 꺼내고 그 자리를 None으로 비웁니다. 꺼낸 게 있었으면 1입니다.
+                    Some(entry) => integer(i64::from(entry.expires_at.take().is_some())),
+                    None => integer(0),
+                }
+            }
+            // 만료됐지만 아직 안 지워진 키도 셉니다. 진짜 Redis도 같아서, active expiration이 없으면 줄지 않습니다.
+            Command::DbSize => integer(i64::try_from(db.lock().count()).unwrap_or(i64::MAX)),
         }
     }
+}
+
+/// `SET key value [NX | XX] [EX seconds | PX milliseconds]`
+/// 옵션 문법을 끝까지 본 뒤에 숫자를 봅니다. 진짜 Redis도 그래서 `SET k v EX abc NX XX`는 syntax error입니다.
+fn parse_set(
+    key: Vec<u8>,
+    value: Vec<u8>,
+    mut options: impl Iterator<Item = Vec<u8>>,
+    now: Instant,
+) -> Result<Command, CommandError> {
+    let mut condition = None;
+    // 숫자는 아직 글자 그대로 받아 둡니다. 같은 옵션을 또 쓰면(`EX 10 EX 20`) 뒤의 것이 이깁니다.
+    let mut expire: Option<(Vec<u8>, TimeUnit)> = None;
+
+    while let Some(option) = options.next() {
+        match option.to_ascii_uppercase().as_slice() {
+            // 같이 쓸 수 없는 짝(NX와 XX, EX와 PX)이 이미 있으면 match guard에서 걸러져 맨 아래 syntax error로 갑니다.
+            b"NX" if condition != Some(SetCondition::Xx) => condition = Some(SetCondition::Nx),
+            b"XX" if condition != Some(SetCondition::Nx) => condition = Some(SetCondition::Xx),
+            b"EX" if !matches!(expire, Some((_, TimeUnit::Millis))) => {
+                let amount = options.next().ok_or(CommandError::Syntax)?;
+                expire = Some((amount, TimeUnit::Seconds));
+            }
+            b"PX" if !matches!(expire, Some((_, TimeUnit::Seconds))) => {
+                let amount = options.next().ok_or(CommandError::Syntax)?;
+                expire = Some((amount, TimeUnit::Millis));
+            }
+            // GET, KEEPTTL, EXAT, PXAT 같은 진짜 옵션도 이번 범위가 아니라서 여기로 옵니다.
+            _ => return Err(CommandError::Syntax),
+        }
+    }
+
+    let expires_at = match expire {
+        None => None,
+        Some((amount, unit)) => {
+            let amount = parse_integer(&amount).ok_or(CommandError::NotInteger)?;
+            let millis = match unit {
+                TimeUnit::Seconds => amount.checked_mul(1000),
+                TimeUnit::Millis => Some(amount),
+            };
+            // EXPIRE와 달리 SET은 0 이하를 에러로 봅니다. (`SET k v EX 0` → invalid expire time)
+            let at = millis
+                .filter(|&millis| millis > 0)
+                .and_then(|millis| after_millis(now, millis))
+                .ok_or(CommandError::InvalidExpireTime("set"))?;
+            Some(at)
+        }
+    };
+
+    Ok(Command::Set {
+        key,
+        value,
+        condition,
+        expires_at,
+    })
+}
+
+/// `now`에서 `millis`밀리초 뒤의 시각입니다. 0 이하면 `now` 그대로라 이미 만료된 시각이 됩니다.
+/// `Instant`로 나타낼 수 없을 만큼 크면 None입니다.
+fn after_millis(now: Instant, millis: i64) -> Option<Instant> {
+    match u64::try_from(millis) {
+        Ok(millis) => now.checked_add(Duration::from_millis(millis)),
+        // 음수는 u64로 못 바꿉니다
+        Err(_) => Some(now),
+    }
+}
+
+/// 진짜 Redis(string2ll)처럼 `+10`, `010`, `-0`, 공백이 낀 숫자는 정수로 보지 않습니다.
+/// Rust의 `parse`는 이런 것도 받아 주므로, 다시 글자로 바꿨을 때 입력과 똑같은지 확인합니다.
+fn parse_integer(bytes: &[u8]) -> Option<i64> {
+    let number: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+    (number.to_string().as_bytes() == bytes).then_some(number)
 }
 
 impl CommandError {
@@ -155,6 +354,19 @@ impl CommandError {
                 format!("ERR wrong number of arguments for '{name}' command").into_bytes()
             }
             CommandError::Syntax => b"ERR syntax error".to_vec(),
+            CommandError::NotInteger => b"ERR value is not an integer or out of range".to_vec(),
+            CommandError::InvalidExpireTime(name) => {
+                format!("ERR invalid expire time in '{name}' command").into_bytes()
+            }
+            CommandError::UnsupportedOption(option) => {
+                let mut message = b"ERR Unsupported option ".to_vec();
+                // 에러는 한 줄이라, 진짜 Redis는 옵션 안의 \r과 \n을 공백으로 바꿔서 보냅니다.
+                message.extend(option.iter().map(|&byte| match byte {
+                    b'\r' | b'\n' => b' ',
+                    other => other,
+                }));
+                message
+            }
         }
     }
 }
@@ -169,12 +381,21 @@ mod tests {
 
     /// 저장소를 쓰지 않는 커맨드용입니다. 매번 빈 저장소로 실행합니다.
     fn run(parts: &[&str]) -> Vec<u8> {
-        build_reply(words(parts), &Db::default())
+        build_reply(words(parts), &Db::default(), Instant::now())
     }
 
     /// 같은 저장소에 커맨드를 이어서 보냅니다.
     fn run_on(db: &Db, parts: &[&str]) -> Vec<u8> {
-        build_reply(words(parts), db)
+        build_reply(words(parts), db, Instant::now())
+    }
+
+    /// 시각을 정해서 보냅니다. `start + 200초`를 넘기면 sleep 없이 "200초 뒤"가 됩니다.
+    fn run_at(db: &Db, now: Instant, parts: &[&str]) -> Vec<u8> {
+        build_reply(words(parts), db, now)
+    }
+
+    fn after(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
     }
 
     #[test]
@@ -261,6 +482,12 @@ mod tests {
         assert_eq!(run(&["GET", "k", "extra"]), wrong("get"));
         assert_eq!(run(&["DEL"]), wrong("del"));
         assert_eq!(run(&["EXISTS"]), wrong("exists"));
+        assert_eq!(run(&["EXPIRE", "k"]), wrong("expire"));
+        assert_eq!(run(&["TTL"]), wrong("ttl"));
+        assert_eq!(run(&["TTL", "a", "b"]), wrong("ttl"));
+        assert_eq!(run(&["PERSIST"]), wrong("persist"));
+        assert_eq!(run(&["PERSIST", "a", "b"]), wrong("persist"));
+        assert_eq!(run(&["DBSIZE", "x"]), wrong("dbsize"));
         // 키와 값 뒤에 남는 인자는 개수 에러가 아니라 모르는 옵션입니다
         assert_eq!(
             run(&["SET", "k", "v", "foo"]),
@@ -272,6 +499,190 @@ mod tests {
     fn 에러가_난_set은_저장하지_않는다() {
         let db = Db::default();
         run_on(&db, &["SET", "k", "v", "foo"]);
+        run_on(&db, &["SET", "k", "v", "EX", "0"]);
         assert_eq!(run_on(&db, &["GET", "k"]), b"$-1\r\n".to_vec());
+    }
+
+    #[test]
+    fn ttl은_초로_반올림한다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "k", "v", "EX", "100"]);
+        // 99.990초 남음 → 100, 99.600초 → 100, 99.400초 → 99
+        assert_eq!(run_at(&db, after(start, 10), &["TTL", "k"]), b":100\r\n");
+        assert_eq!(run_at(&db, after(start, 400), &["TTL", "k"]), b":100\r\n");
+        assert_eq!(run_at(&db, after(start, 600), &["TTL", "k"]), b":99\r\n");
+        // TTL이 없는 키는 -1, 없는 키는 -2
+        run_at(&db, start, &["SET", "plain", "v"]);
+        assert_eq!(run_at(&db, start, &["TTL", "plain"]), b":-1\r\n");
+        assert_eq!(run_at(&db, start, &["TTL", "nope"]), b":-2\r\n");
+    }
+
+    #[test]
+    fn 만료된_키는_어디서_봐도_없다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "k", "v", "PX", "100"]);
+        assert_eq!(run_at(&db, after(start, 99), &["GET", "k"]), b"$1\r\nv\r\n");
+        // 100ms가 지나면 만료입니다. 각 커맨드마다 다시 만들어 확인합니다.
+        let later = after(start, 100);
+        let fresh = || {
+            let db = Db::default();
+            run_at(&db, start, &["SET", "k", "v", "PX", "100"]);
+            db
+        };
+        assert_eq!(run_at(&fresh(), later, &["GET", "k"]), b"$-1\r\n");
+        assert_eq!(run_at(&fresh(), later, &["EXISTS", "k"]), b":0\r\n");
+        assert_eq!(run_at(&fresh(), later, &["TTL", "k"]), b":-2\r\n");
+        assert_eq!(run_at(&fresh(), later, &["DEL", "k"]), b":0\r\n");
+        assert_eq!(run_at(&fresh(), later, &["PERSIST", "k"]), b":0\r\n");
+        assert_eq!(run_at(&fresh(), later, &["EXPIRE", "k", "100"]), b":0\r\n");
+        assert_eq!(
+            run_at(&fresh(), later, &["SET", "k", "w", "XX"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(
+            run_at(&fresh(), later, &["SET", "k", "w", "NX"]),
+            b"+OK\r\n"
+        );
+    }
+
+    #[test]
+    fn nx_xx로_못_쓰면_nil이다() {
+        // difftest에서는 nil이 빈 줄로 보여서 바이트로 확인합니다.
+        let db = Db::default();
+        assert_eq!(
+            run_on(&db, &["SET", "lock", "a", "NX", "EX", "30"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            run_on(&db, &["SET", "lock", "b", "NX", "EX", "30"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(run_on(&db, &["GET", "lock"]), b"$1\r\na\r\n");
+        assert_eq!(run_on(&db, &["SET", "nope", "v", "XX"]), b"$-1\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "nope"]), b":0\r\n");
+        assert_eq!(run_on(&db, &["SET", "lock", "c", "xx"]), b"+OK\r\n");
+        assert_eq!(run_on(&db, &["GET", "lock"]), b"$1\r\nc\r\n");
+    }
+
+    #[test]
+    fn 옵션_없는_set은_ttl을_지운다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "k", "v", "EX", "100"]);
+        run_at(&db, start, &["SET", "k", "v2", "XX"]);
+        assert_eq!(run_at(&db, start, &["TTL", "k"]), b":-1\r\n");
+        // 200초 뒤에도 남아 있습니다
+        assert_eq!(
+            run_at(&db, after(start, 200_000), &["GET", "k"]),
+            b"$2\r\nv2\r\n"
+        );
+    }
+
+    #[test]
+    fn 같은_옵션을_또_쓰면_뒤의_것이_이긴다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "k", "v", "EX", "10", "EX", "20"]);
+        assert_eq!(run_at(&db, start, &["TTL", "k"]), b":20\r\n");
+        run_at(&db, start, &["SET", "k", "v", "NX", "NX"]);
+        run_at(&db, start, &["SET", "k", "v", "px", "3000", "xx"]);
+        assert_eq!(run_at(&db, start, &["TTL", "k"]), b":3\r\n");
+    }
+
+    #[test]
+    fn expire와_persist() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "k", "v"]);
+        assert_eq!(run_at(&db, start, &["EXPIRE", "k", "100"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["EXPIRE", "nope", "100"]), b":0\r\n");
+        // 다시 걸면 짧아져도 덮어씁니다
+        assert_eq!(run_at(&db, start, &["EXPIRE", "k", "50"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["TTL", "k"]), b":50\r\n");
+        assert_eq!(run_at(&db, start, &["PERSIST", "k"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["PERSIST", "k"]), b":0\r\n");
+        assert_eq!(run_at(&db, start, &["TTL", "k"]), b":-1\r\n");
+        assert_eq!(run_at(&db, start, &["PERSIST", "nope"]), b":0\r\n");
+    }
+
+    #[test]
+    fn 영이나_음수로_expire하면_바로_지운다() {
+        let db = Db::default();
+        run_on(&db, &["SET", "k", "v"]);
+        assert_eq!(run_on(&db, &["EXPIRE", "k", "0"]), b":1\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "k"]), b":0\r\n");
+        run_on(&db, &["SET", "k", "v"]);
+        assert_eq!(run_on(&db, &["EXPIRE", "k", "-5"]), b":1\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "k"]), b":0\r\n");
+        assert_eq!(run_on(&db, &["EXPIRE", "nope", "-5"]), b":0\r\n");
+    }
+
+    #[test]
+    fn 옵션과_숫자_에러가_진짜_redis와_같다() {
+        let syntax = b"-ERR syntax error\r\n".to_vec();
+        let not_integer = b"-ERR value is not an integer or out of range\r\n".to_vec();
+        let invalid_set = b"-ERR invalid expire time in 'set' command\r\n".to_vec();
+        let invalid_expire = b"-ERR invalid expire time in 'expire' command\r\n".to_vec();
+
+        assert_eq!(run(&["SET", "k", "v", "NX", "XX"]), syntax);
+        assert_eq!(run(&["SET", "k", "v", "EX", "10", "PX", "100"]), syntax);
+        assert_eq!(run(&["SET", "k", "v", "EX"]), syntax);
+        assert_eq!(run(&["SET", "k", "v", "KEEPTTL"]), syntax);
+        // 문법 에러가 숫자 에러보다 먼저입니다
+        assert_eq!(run(&["SET", "k", "v", "EX", "abc", "NX", "XX"]), syntax);
+
+        for bad in ["abc", "1.5", "+10", "010", "-0", " 10", ""] {
+            assert_eq!(
+                run(&["SET", "k", "v", "EX", bad]),
+                not_integer,
+                "EX {bad:?}"
+            );
+            assert_eq!(run(&["EXPIRE", "k", bad]), not_integer, "EXPIRE {bad:?}");
+        }
+
+        assert_eq!(run(&["SET", "k", "v", "EX", "0"]), invalid_set);
+        assert_eq!(run(&["SET", "k", "v", "EX", "-1"]), invalid_set);
+        assert_eq!(run(&["SET", "k", "v", "PX", "0"]), invalid_set);
+        // 초 → 밀리초에서 i64를 넘칩니다
+        assert_eq!(
+            run(&["SET", "k", "v", "EX", "9223372036854776"]),
+            invalid_set
+        );
+        assert_eq!(run(&["EXPIRE", "k", "9999999999999999"]), invalid_expire);
+        assert_eq!(run(&["EXPIRE", "k", "-9223372036854776"]), invalid_expire);
+    }
+
+    #[test]
+    fn expire_옵션은_모르는_옵션이다() {
+        assert_eq!(
+            run(&["EXPIRE", "k", "10", "foo"]),
+            b"-ERR Unsupported option foo\r\n".to_vec()
+        );
+        // 진짜 Redis도 숫자보다 옵션을 먼저 봅니다
+        assert_eq!(
+            run(&["EXPIRE", "k", "abc", "foo"]),
+            b"-ERR Unsupported option foo\r\n".to_vec()
+        );
+        // 에러 줄 안에 \r\n이 들어가지 않게 공백으로 바꿉니다
+        assert_eq!(
+            run(&["EXPIRE", "k", "10", "a\r\nb!"]),
+            b"-ERR Unsupported option a  b!\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn dbsize는_만료된_키도_지워지기_전까지_센다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "a", "v", "PX", "100"]);
+        run_at(&db, start, &["SET", "b", "v"]);
+        let later = after(start, 200);
+        // a는 만료됐지만 아무도 안 읽어서 아직 저장소에 있습니다
+        assert_eq!(run_at(&db, later, &["DBSIZE"]), b":2\r\n");
+        // 백그라운드 스레드가 하는 일을 직접 한 번 부릅니다
+        db.lock().remove_expired(later);
+        assert_eq!(run_at(&db, later, &["DBSIZE"]), b":1\r\n");
     }
 }

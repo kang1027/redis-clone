@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 
 use connection::Connection;
-use db::Db;
+use db::{Db, expire_forever};
 
 /// 진짜 Redis가 6379를 쓰기 때문에 우리는 6380을 씁니다.
 const DEFAULT_PORT: u16 = 6380;
@@ -35,6 +35,10 @@ fn main() {
     // 저장소는 서버에 하나만 있습니다.
     // 스레드는 main보다 오래 살 수 있어서 `&db`(빌림)를 넘길 수 없습니다. 그래서 `Arc`로 같이 소유합니다.
     let db = Arc::new(Db::default());
+
+    // 만료된 키를 지우는 스레드도 같은 저장소를 같이 소유합니다.
+    let cleaner = Arc::clone(&db);
+    thread::spawn(move || expire_forever(&cleaner));
 
     for incoming in listener.incoming() {
         match incoming {

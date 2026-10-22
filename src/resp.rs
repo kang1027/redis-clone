@@ -257,7 +257,7 @@ mod tests {
     fn 빈_배열은_에러가_아니라_빈_명령이다() {
         assert_eq!(complete(b"*0\r\n"), (Vec::new(), 4));
         assert_eq!(complete(b"*-1\r\n"), (Vec::new(), 5));
-        assert!(build_reply(Vec::new(), &Db::default()).is_empty());
+        assert!(build_reply(Vec::new(), &Db::default(), std::time::Instant::now()).is_empty());
     }
 
     #[test]
