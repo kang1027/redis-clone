@@ -1,0 +1,132 @@
+# 세션 5: INCR / DECR / INCRBY
+#
+# 주의: redis-cli 출력을 비교하므로 정수 :11 과 문자열 $2 11 이 구분되지 않습니다.
+#       줄을 공백으로 쪼개서 보내므로 빈 값과 " 10" 같은 값도 여기 못 넣습니다.
+#       둘 다 src/command.rs 의 단위 테스트에 있습니다.
+
+# 없는 키는 0에서 시작합니다
+INCR n
+INCR n
+GET n
+DECR d
+INCRBY b 5
+INCRBY b -7
+GET b
+
+# 0을 더해도 키가 생깁니다
+INCRBY z 0
+EXISTS z
+
+# 값은 문자열로 저장돼 있어도 정수처럼 보이면 됩니다
+SET k 10
+INCR k
+DECR k
+INCRBY k 100
+GET k
+incr k
+iNcRbY k 2
+
+# 숫자가 아닌 값. 실패해도 값은 그대로입니다
+SET k abc
+INCR k
+DECR k
+INCRBY k 1
+GET k
+
+# 진짜 Redis가 정수로 안 보는 글자들
+SET k 1.5
+INCR k
+SET k +10
+INCR k
+GET k
+SET k 010
+INCR k
+GET k
+SET k -0
+INCR k
+SET k 0x10
+INCR k
+SET k 1e3
+INCR k
+SET k 9223372036854775808
+INCR k
+
+# 오버플로. 에러 문구가 숫자 아닌 값과 다르고, 값은 그대로입니다
+SET k 9223372036854775807
+INCR k
+GET k
+SET k -9223372036854775808
+DECR k
+GET k
+INCR k
+SET k 1
+INCRBY k 9223372036854775807
+GET k
+SET k -1
+INCRBY k -9223372036854775808
+INCRBY k 9223372036854775807
+SET k 0
+INCRBY k -9223372036854775808
+GET k
+INCRBY k -1
+
+# INCRBY의 인자도 같은 규칙입니다. 값을 보기 전에 인자부터 봅니다
+SET k 1
+INCRBY k abc
+INCRBY k 1.5
+INCRBY k +1
+INCRBY k 010
+INCRBY k -0
+INCRBY k 9223372036854775808
+INCRBY k -9223372036854775809
+GET k
+
+# 실패하면 없던 키가 생기지 않습니다
+INCRBY nope abc
+EXISTS nope
+
+# 인자 개수
+INCR
+INCR a b
+DECR
+DECR a b
+INCRBY
+INCRBY a
+INCRBY a 1 2
+INCRBY a abc 2
+
+# TTL은 값만 바뀌어도 그대로입니다
+SET t 1 EX 100
+INCR t
+TTL t
+DECR t
+TTL t
+INCRBY t 5
+TTL t
+
+# 실패해도 TTL은 그대로입니다
+SET t abc EX 100
+INCR t
+TTL t
+
+# 만료된 키는 없는 키입니다. 0에서 다시 시작하고 TTL도 없습니다
+SET t 1 PX 100
+SLEEP 0.3
+INCR t
+TTL t
+
+# rate limiter. 처음 INCR 뒤에 EXPIRE를 걸면, 다음 INCR이 그 TTL을 건드리지 않습니다
+INCR rl
+EXPIRE rl 60
+INCR rl
+TTL rl
+
+# S01 ~ S04 가 깨지지 않았는지
+PING
+ECHO hello
+GET t
+DBSIZE
+
+# 이 파일이 남긴 키를 지웁니다. 우리 서버는 FLUSHALL이 없어서, 남겨 두면 다음 파일의 DBSIZE가 깨집니다
+DEL n d b z k t rl
+DBSIZE

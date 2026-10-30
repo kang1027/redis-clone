@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::db::{Db, Entry};
+use crate::db::{Db, Entries, Entry};
 use crate::reply::{bulk_string, error_reply, integer, null_bulk_string};
 
 /// 인자 개수 검사를 통과한 커맨드입니다.
@@ -37,6 +37,11 @@ enum Command {
         key: Vec<u8>,
     },
     DbSize,
+    /// `INCR`은 `delta`가 1, `DECR`은 -1인 `INCRBY`입니다.
+    IncrBy {
+        key: Vec<u8>,
+        delta: i64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -66,6 +71,7 @@ enum CommandError {
     /// `SET`의 모르는 옵션이나 같이 쓸 수 없는 옵션(`NX XX`, `EX PX`)입니다.
     Syntax,
     NotInteger,
+    Overflow,
     /// 이름이 들어가는 자리는 `'set'`, `'expire'`처럼 소문자입니다.
     InvalidExpireTime(&'static str),
     /// `EXPIRE` 뒤에 붙은 옵션입니다. 옵션(NX/XX/GT/LT)은 이번 범위가 아니라 전부 여기로 옵니다.
@@ -87,7 +93,8 @@ pub fn build_reply(command: Vec<Vec<u8>>, db: &Db, now: Instant) -> Vec<u8> {
 }
 
 impl Command {
-    /// 인자 개수, 옵션 문법, 숫자는 여기서 전부 확인합니다. 그래서 `execute`는 실패하지 않습니다.
+    /// 인자 개수, 옵션 문법, 인자로 온 숫자는 여기서 전부 확인합니다.
+    /// `execute`에서 나는 에러는 저장된 값을 봐야 알 수 있는 것(`INCR` 계열)뿐입니다.
     fn parse(name: Vec<u8>, args: Vec<Vec<u8>>, now: Instant) -> Result<Command, CommandError> {
         match name.to_ascii_uppercase().as_slice() {
             b"PING" => {
@@ -159,6 +166,21 @@ impl Command {
                 }
                 Ok(Command::DbSize)
             }
+            b"INCR" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::IncrBy { key, delta: 1 }),
+                Err(_) => Err(CommandError::WrongArity("incr")),
+            },
+            b"DECR" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::IncrBy { key, delta: -1 }),
+                Err(_) => Err(CommandError::WrongArity("decr")),
+            },
+            b"INCRBY" => match <[Vec<u8>; 2]>::try_from(args) {
+                Ok([key, delta]) => {
+                    let delta = parse_integer(&delta).ok_or(CommandError::NotInteger)?;
+                    Ok(Command::IncrBy { key, delta })
+                }
+                Err(_) => Err(CommandError::WrongArity("incrby")),
+            },
             _ => Err(CommandError::Unknown { name, args }),
         }
     }
@@ -259,8 +281,44 @@ impl Command {
             }
             // 만료됐지만 아직 안 지워진 키도 셉니다. 진짜 Redis도 같아서, active expiration이 없으면 줄지 않습니다.
             Command::DbSize => integer(i64::try_from(db.lock().count()).unwrap_or(i64::MAX)),
+            Command::IncrBy { key, delta } => {
+                let mut entries = db.lock();
+                // 읽기, 더하기, 쓰기가 락 한 번 안에서 끝납니다. 앱이 GET → +1 → SET으로 나눠 보내면
+                // 그 사이에 다른 커넥션이 끼어들어 값을 잃어버립니다(lost update). 이걸 막는 게 INCR입니다.
+                match incr_by(&mut entries, key, delta, now) {
+                    Ok(number) => integer(number),
+                    Err(error) => error_reply(&error.message()),
+                }
+            }
         }
     }
+}
+
+/// 값은 숫자여도 바이트로 둡니다. 매번 읽어서 정수로 바꾸고, 결과를 다시 바이트로 씁니다.
+/// 정수로 따로 저장하면 `SET k 010`을 `GET`했을 때 `10`이 되지 않게 신경 써야 합니다.
+/// `entry.value`만 바꾸므로 걸려 있던 TTL은 그대로입니다.
+fn incr_by(
+    entries: &mut Entries,
+    key: Vec<u8>,
+    delta: i64,
+    now: Instant,
+) -> Result<i64, CommandError> {
+    let Some(entry) = entries.live(&key, now) else {
+        // 없는 키(만료된 키 포함)는 0에서 시작합니다. 0 + delta는 넘칠 수 없습니다.
+        let value = delta.to_string().into_bytes();
+        entries.insert(
+            key,
+            Entry {
+                value,
+                expires_at: None,
+            },
+        );
+        return Ok(delta);
+    };
+    let current = parse_integer(&entry.value).ok_or(CommandError::NotInteger)?;
+    let next = current.checked_add(delta).ok_or(CommandError::Overflow)?;
+    entry.value = next.to_string().into_bytes();
+    Ok(next)
 }
 
 /// `SET key value [NX | XX] [EX seconds | PX milliseconds]`
@@ -355,6 +413,7 @@ impl CommandError {
             }
             CommandError::Syntax => b"ERR syntax error".to_vec(),
             CommandError::NotInteger => b"ERR value is not an integer or out of range".to_vec(),
+            CommandError::Overflow => b"ERR increment or decrement would overflow".to_vec(),
             CommandError::InvalidExpireTime(name) => {
                 format!("ERR invalid expire time in '{name}' command").into_bytes()
             }
@@ -684,5 +743,160 @@ mod tests {
         // 백그라운드 스레드가 하는 일을 직접 한 번 부릅니다
         db.lock().remove_expired(later);
         assert_eq!(run_at(&db, later, &["DBSIZE"]), b":1\r\n");
+    }
+
+    #[test]
+    fn incr_계열은_정수로_답하고_get은_문자열로_답한다() {
+        // 정수(`:1`)와 문자열 "1"(`$1\r\n1`)은 difftest에서 구분되지 않습니다.
+        let db = Db::default();
+        assert_eq!(run_on(&db, &["INCR", "n"]), b":1\r\n");
+        assert_eq!(run_on(&db, &["incr", "n"]), b":2\r\n");
+        assert_eq!(run_on(&db, &["GET", "n"]), b"$1\r\n2\r\n");
+        assert_eq!(run_on(&db, &["DECR", "d"]), b":-1\r\n");
+        assert_eq!(run_on(&db, &["INCRBY", "b", "5"]), b":5\r\n");
+        assert_eq!(run_on(&db, &["INCRBY", "b", "-7"]), b":-2\r\n");
+        assert_eq!(run_on(&db, &["GET", "b"]), b"$2\r\n-2\r\n");
+        // 0을 더해도 키가 생깁니다
+        assert_eq!(run_on(&db, &["INCRBY", "z", "0"]), b":0\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "z"]), b":1\r\n");
+    }
+
+    #[test]
+    fn 정수가_아닌_값은_에러이고_그대로_남는다() {
+        let not_integer = b"-ERR value is not an integer or out of range\r\n".to_vec();
+        // 빈 값, 공백, UTF-8이 아닌 바이트는 redis-cli 케이스로 못 보내서 여기서 봅니다.
+        let bad_values: [&[u8]; 10] = [
+            b"abc",
+            b"",
+            b"1.5",
+            b"+10",
+            b"010",
+            b"-0",
+            b" 10",
+            b"10 ",
+            b"9223372036854775808",
+            b"\xff\xfe",
+        ];
+        for bad in bad_values {
+            let db = Db::default();
+            build_reply(
+                vec![b"SET".to_vec(), b"k".to_vec(), bad.to_vec()],
+                &db,
+                Instant::now(),
+            );
+            assert_eq!(run_on(&db, &["INCR", "k"]), not_integer, "{bad:?}");
+            assert_eq!(run_on(&db, &["DECR", "k"]), not_integer, "{bad:?}");
+            assert_eq!(run_on(&db, &["INCRBY", "k", "1"]), not_integer, "{bad:?}");
+            assert_eq!(
+                run_on(&db, &["GET", "k"]),
+                [format!("${}\r\n", bad.len()).as_bytes(), bad, b"\r\n"].concat(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incrby_인자가_정수가_아니면_키를_만들지_않는다() {
+        let not_integer = b"-ERR value is not an integer or out of range\r\n".to_vec();
+        let db = Db::default();
+        for bad in [
+            "abc",
+            "",
+            "1.5",
+            "+1",
+            "010",
+            "-0",
+            " 1",
+            "9223372036854775808",
+        ] {
+            assert_eq!(
+                run_on(&db, &["INCRBY", "nope", bad]),
+                not_integer,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(run_on(&db, &["EXISTS", "nope"]), b":0\r\n");
+    }
+
+    #[test]
+    fn 넘치면_다른_에러이고_값은_그대로다() {
+        let overflow = b"-ERR increment or decrement would overflow\r\n".to_vec();
+        let db = Db::default();
+        run_on(&db, &["SET", "k", "9223372036854775807"]);
+        assert_eq!(run_on(&db, &["INCR", "k"]), overflow);
+        assert_eq!(
+            run_on(&db, &["GET", "k"]),
+            b"$19\r\n9223372036854775807\r\n"
+        );
+
+        run_on(&db, &["SET", "k", "-9223372036854775808"]);
+        assert_eq!(run_on(&db, &["DECR", "k"]), overflow);
+        assert_eq!(run_on(&db, &["INCR", "k"]), b":-9223372036854775807\r\n");
+
+        run_on(&db, &["SET", "k", "1"]);
+        assert_eq!(
+            run_on(&db, &["INCRBY", "k", "9223372036854775807"]),
+            overflow
+        );
+        assert_eq!(run_on(&db, &["GET", "k"]), b"$1\r\n1\r\n");
+
+        // 없는 키는 0에서 시작하므로 i64 최소값도 받습니다
+        assert_eq!(
+            run_on(&db, &["INCRBY", "new", "-9223372036854775808"]),
+            b":-9223372036854775808\r\n"
+        );
+        assert_eq!(run_on(&db, &["INCRBY", "new", "-1"]), overflow);
+    }
+
+    #[test]
+    fn 인자_개수가_틀리면_이름이_각자_들어간다() {
+        let wrong = |name: &str| {
+            format!("-ERR wrong number of arguments for '{name}' command\r\n").into_bytes()
+        };
+        assert_eq!(run(&["INCR"]), wrong("incr"));
+        assert_eq!(run(&["INCR", "a", "b"]), wrong("incr"));
+        assert_eq!(run(&["DECR"]), wrong("decr"));
+        assert_eq!(run(&["DECR", "a", "b"]), wrong("decr"));
+        assert_eq!(run(&["INCRBY"]), wrong("incrby"));
+        assert_eq!(run(&["INCRBY", "a"]), wrong("incrby"));
+        // 숫자보다 개수를 먼저 봅니다
+        assert_eq!(run(&["INCRBY", "a", "abc", "2"]), wrong("incrby"));
+    }
+
+    #[test]
+    fn ttl은_그대로이고_만료된_키는_새로_시작한다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["SET", "k", "1", "EX", "100"]);
+        assert_eq!(run_at(&db, start, &["INCR", "k"]), b":2\r\n");
+        assert_eq!(run_at(&db, start, &["DECR", "k"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["INCRBY", "k", "5"]), b":6\r\n");
+        assert_eq!(run_at(&db, start, &["TTL", "k"]), b":100\r\n");
+
+        // 실패해도 TTL은 그대로입니다
+        run_at(&db, start, &["SET", "s", "abc", "EX", "100"]);
+        run_at(&db, start, &["INCR", "s"]);
+        assert_eq!(run_at(&db, start, &["TTL", "s"]), b":100\r\n");
+
+        // 만료된 뒤에는 0에서 시작하고 TTL도 없습니다
+        let later = after(start, 200_000);
+        assert_eq!(run_at(&db, later, &["INCR", "k"]), b":1\r\n");
+        assert_eq!(run_at(&db, later, &["TTL", "k"]), b":-1\r\n");
+    }
+
+    #[test]
+    fn 여러_스레드가_incr해도_빠지는_값이_없다() {
+        // S05의 본론(원자성)은 difftest로 볼 수 없습니다. 커넥션이 한 번에 하나씩만 보내기 때문입니다.
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        run_on(&db, &["INCR", "n"]);
+                    }
+                });
+            }
+        });
+        assert_eq!(run_on(&db, &["GET", "n"]), b"$4\r\n8000\r\n");
     }
 }
