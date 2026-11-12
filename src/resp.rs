@@ -213,7 +213,7 @@ fn parse_number(bytes: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::build_reply;
+    use crate::command::{Outcome, build_reply};
     use crate::db::Db;
 
     fn complete(buffer: &[u8]) -> (Vec<Vec<u8>>, usize) {
@@ -257,7 +257,8 @@ mod tests {
     fn 빈_배열은_에러가_아니라_빈_명령이다() {
         assert_eq!(complete(b"*0\r\n"), (Vec::new(), 4));
         assert_eq!(complete(b"*-1\r\n"), (Vec::new(), 5));
-        assert!(build_reply(Vec::new(), &Db::default(), std::time::Instant::now()).is_empty());
+        let outcome = build_reply(Vec::new(), &Db::default(), std::time::Instant::now());
+        assert!(matches!(outcome, Outcome::Reply(reply) if reply.is_empty()));
     }
 
     #[test]

@@ -1,0 +1,106 @@
+# 세션 7: BLPOP / BRPOP
+#
+# 주의: 이 파일에는 손님 하나로 재현되는 것만 있습니다. 한 줄마다 redis-cli를 새로 띄우기 때문입니다.
+#       기다리다 깨어나는 장면과 대기 순서는 tests/blocking.rs 와 src/command.rs 의 단위 테스트에 있습니다.
+#       nil 배열 *-1 도 redis-cli 출력에서는 nil 문자열 $-1, 빈 배열 *0 과 똑같이 빈 줄입니다. 바이트는 단위 테스트에서 봅니다.
+#       빈 리스트에 timeout 0 을 주는 줄은 넣지 않습니다. 영원히 기다려서 difftest가 멈춥니다.
+#       키 이름은 전부 b7: 로 시작합니다.
+
+# 차 있으면 바로 꺼냅니다. 응답은 키 이름과 값입니다
+RPUSH b7:q a b c
+BLPOP b7:q 0
+BRPOP b7:q 0
+BLPOP b7:q 5
+EXISTS b7:q
+
+# 키가 여럿이면 앞 키부터 보고 처음 차 있는 데서 꺼냅니다
+RPUSH b7:q2 x y
+BLPOP b7:q1 b7:q2 0
+RPUSH b7:q1 first
+BRPOP b7:q1 b7:q2 0
+BRPOP b7:q1 b7:q2 0
+EXISTS b7:q1 b7:q2
+
+# 비어 있으면 timeout만큼 기다렸다가 nil 배열입니다
+BLPOP b7:none 0.1
+BRPOP b7:none 0.1
+BLPOP b7:none b7:none2 0.1
+BLPOP b7:none b7:none 0.1
+BLPOP b7:none 0.0001
+EXISTS b7:none
+
+# 문자열 키를 만나면 기다리지 않고 WRONGTYPE
+SET b7:s str
+BLPOP b7:s 0
+BRPOP b7:s 0
+BLPOP b7:none b7:s 0
+RPUSH b7:l v1 v2
+BLPOP b7:l b7:s 0
+BLPOP b7:s b7:l 0
+BLPOP b7:none b7:l b7:s 0
+EXISTS b7:l
+GET b7:s
+
+# timeout 에러. 키가 문자열이어도 timeout 에러가 먼저입니다
+RPUSH b7:f 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+BLPOP b7:f -1
+BLPOP b7:f -0.5
+BLPOP b7:f abc
+BLPOP b7:f nan
+BLPOP b7:f inf
+BLPOP b7:f -inf
+BLPOP b7:f 1e16
+BLPOP b7:f 9223372036854775807
+BLPOP b7:f 1,5
+BLPOP b7:f 1_0
+BLPOP b7:s abc
+BLPOP b7:s -1
+BRPOP b7:f -1
+BRPOP b7:f abc
+LLEN b7:f
+
+# timeout으로 받아 주는 표기
+BLPOP b7:f 0.5
+BLPOP b7:f +1
+BLPOP b7:f 1.
+BLPOP b7:f .5
+BLPOP b7:f 1e0
+BLPOP b7:f 1E0
+BLPOP b7:f -0
+BLPOP b7:f -0.0
+BLPOP b7:f 00.5
+BLPOP b7:f 0.0001
+BLPOP b7:f 1e-9
+BLPOP b7:f 1e15
+blpop b7:f 0
+bRpOp b7:f 0
+LRANGE b7:f 0 -1
+
+# 인자 개수
+BLPOP
+BLPOP b7:f
+BRPOP
+BRPOP b7:f
+
+# TTL은 꺼내도 그대로이고, 마지막 원소를 꺼내면 키와 같이 사라집니다
+RPUSH b7:t a b
+EXPIRE b7:t 100
+BLPOP b7:t 0
+TTL b7:t
+BRPOP b7:t 0
+TTL b7:t
+
+# 만료된 리스트는 빈 리스트입니다
+RPUSH b7:px a
+EXPIRE b7:px 0
+BLPOP b7:px 0.1
+
+# S01 ~ S06 가 깨지지 않았는지
+PING
+RPUSH b7:k a
+LPOP b7:k
+LPOP b7:k
+
+# 이 파일이 남긴 키를 지웁니다
+DEL b7:s b7:f
+DBSIZE

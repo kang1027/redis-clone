@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::command::build_reply;
+use crate::command::{Outcome, build_reply};
 use crate::db::Db;
 use crate::reply::error_reply;
 use crate::resp::{Parsed, parse_command};
@@ -75,7 +75,23 @@ impl Connection {
                 Parsed::Complete(command, consumed) => {
                     cursor += consumed;
                     // 시각은 명령마다 한 번 잽니다. 진짜 Redis도 명령 하나 안에서는 같은 시각을 씁니다.
-                    replies.extend_from_slice(&build_reply(command, &self.db, Instant::now()));
+                    match build_reply(command, &self.db, Instant::now()) {
+                        Outcome::Reply(reply) => replies.extend_from_slice(&reply),
+                        Outcome::Block(blocked) => {
+                            // 자기 전에, 앞 명령들의 응답부터 보냅니다. 안 그러면 `PING`과 `BLPOP q 0`을
+                            // 붙여 보낸 클라이언트가 PONG을 값이 올 때까지 못 받습니다.
+                            if let Err(error) = self.stream.write_all(&replies) {
+                                eprintln!("쓰지 못했습니다: {error}");
+                                blocked.cancel(&self.db);
+                                replies.clear();
+                                fatal = true;
+                                break;
+                            }
+                            replies.clear();
+                            // 이 커넥션의 스레드만 잡니다. 저장소 락은 잡고 있지 않아서 다른 커넥션은 계속 처리됩니다.
+                            replies.extend_from_slice(&blocked.wait(&self.db));
+                        }
+                    }
                 }
                 // 뒷부분이 아직 안 왔습니다. 더 읽습니다.
                 Parsed::Incomplete => break,

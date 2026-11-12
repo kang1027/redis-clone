@@ -17,6 +17,11 @@ pub fn array_header(count: usize) -> Vec<u8> {
     format!("*{count}\r\n").into_bytes()
 }
 
+/// 받을 게 없다는 뜻의 Null Array입니다. 빈 배열(`*0\r\n`)과도, Null Bulk String(`$-1\r\n`)과도 다릅니다.
+pub fn null_array() -> Vec<u8> {
+    b"*-1\r\n".to_vec()
+}
+
 pub fn integer(value: i64) -> Vec<u8> {
     format!(":{value}\r\n").into_bytes()
 }

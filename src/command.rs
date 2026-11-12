@@ -2,10 +2,11 @@
 
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use crate::db::{Db, Entries, Entry, Value};
-use crate::reply::{array_header, bulk_string, error_reply, integer, null_bulk_string};
+use crate::db::{Db, Delivery, End, Entries, Entry, Value};
+use crate::reply::{array_header, bulk_string, error_reply, integer, null_array, null_bulk_string};
 
 /// 인자 개수 검사를 통과한 커맨드입니다.
 /// 인자를 복사하지 않고 넘겨받아(소유해서) 들고 있습니다.
@@ -64,13 +65,68 @@ enum Command {
     LLen {
         key: Vec<u8>,
     },
+    /// `BLPOP`과 `BRPOP`입니다. 키가 하나 이상 들어 있습니다.
+    BlockingPop {
+        keys: Vec<Vec<u8>>,
+        end: End,
+        /// 이 시각까지 기다립니다. None이면 timeout 0, 즉 값이 올 때까지 기다립니다.
+        deadline: Option<Instant>,
+    },
 }
 
-/// 리스트의 어느 쪽 끝인지입니다. `L`로 시작하는 커맨드는 왼쪽(앞), `R`은 오른쪽(뒤)입니다.
-#[derive(Clone, Copy)]
-enum End {
-    Left,
-    Right,
+/// 커맨드를 실행한 결과입니다. 거의 전부 바로 보낼 응답이고, 빈 리스트를 만난 `BLPOP`/`BRPOP`만 `Block`입니다.
+pub enum Outcome {
+    Reply(Vec<u8>),
+    Block(Blocked),
+}
+
+/// 값을 못 받고 대기자 명단에 올라간 `BLPOP`/`BRPOP`입니다.
+/// 커넥션이 `wait`를 부르면 값이 오거나 시간이 다 될 때까지 그 커넥션 스레드만 잡니다.
+pub struct Blocked {
+    /// 명단에서 나를 찾는 번호표입니다.
+    id: u64,
+    /// 내 우편함의 받는 쪽입니다. 넣는 쪽 커넥션이 명단에 있는 `Sender`로 값을 넣어 줍니다.
+    receiver: Receiver<Delivery>,
+    deadline: Option<Instant>,
+}
+
+impl Blocked {
+    /// 락을 잡지 않은 채로 잡니다. 락을 쥐고 자면 값을 넣으러 온 커넥션이 못 들어와서 서로 영원히 기다립니다.
+    pub fn wait(self, db: &Db) -> Vec<u8> {
+        let received = match self.deadline {
+            // `recv`는 값이 올 때까지, `recv_timeout`은 길어야 그 시간만큼 이 스레드를 재웁니다.
+            None => self.receiver.recv().ok(),
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                self.receiver.recv_timeout(left).ok()
+            }
+        };
+        let delivery = match received {
+            Some(delivery) => Some(delivery),
+            None => {
+                // 시간이 다 됐습니다. 락을 잡고 명단에서 내 이름을 지웁니다.
+                // 이 줄 끝에서 guard가 사라져 락이 풀립니다.
+                let still_waiting = db.lock().remove_waiter(self.id);
+                if still_waiting {
+                    None
+                } else {
+                    // 깨어나서 락을 잡기 직전에 넣는 쪽이 나를 명단에서 꺼내 값을 넘긴 경우입니다.
+                    // 그 값은 이미 우편함에 있습니다. 여기서 안 꺼내면 아무도 못 받고 사라집니다.
+                    self.receiver.try_recv().ok()
+                }
+            }
+        };
+        match delivery {
+            Some((key, value)) => key_and_value(&key, &value),
+            // 시간이 다 되면 nil 배열입니다. `LPOP`의 nil(`$-1`)과 바이트가 다릅니다.
+            None => null_array(),
+        }
+    }
+
+    /// 자러 가기 전에 연결이 끊긴 걸 알았을 때 부릅니다. 명단에서 이름만 지웁니다.
+    pub fn cancel(self, db: &Db) {
+        db.lock().remove_waiter(self.id);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -107,20 +163,25 @@ enum CommandError {
     UnsupportedOption(Vec<u8>),
     /// 문자열 키에 리스트 커맨드를 썼거나 그 반대입니다. 이 에러만 `ERR`로 시작하지 않습니다.
     WrongType,
+    /// `BLPOP`의 timeout이 숫자가 아닙니다.
+    TimeoutNotFloat,
+    TimeoutNegative,
+    /// 숫자이긴 한데 밀리초로 바꾸면 i64에 안 들어갑니다. `inf`도 여기입니다.
+    TimeoutOutOfRange,
 }
 
 /// `now`는 이 명령을 처리하는 시각입니다. 테스트는 여기에 "200초 뒤"를 넘겨서 sleep 없이 만료를 확인합니다.
-pub fn build_reply(command: Vec<Vec<u8>>, db: &Db, now: Instant) -> Vec<u8> {
+pub fn build_reply(command: Vec<Vec<u8>>, db: &Db, now: Instant) -> Outcome {
     let mut parts = command.into_iter();
     // 빈 배열(`*0\r\n`)이나 빈 인라인 줄에는 진짜 Redis도 아무 응답을 하지 않습니다.
     let Some(name) = parts.next() else {
-        return Vec::new();
+        return Outcome::Reply(Vec::new());
     };
 
     // `and_then`은 parse가 성공했을 때만 execute를 부릅니다. 어느 쪽에서 실패하든 에러는 여기 한 곳에서 응답으로 바뀝니다.
     match Command::parse(name, parts.collect(), now).and_then(|command| command.execute(db, now)) {
-        Ok(reply) => reply,
-        Err(error) => error_reply(&error.message()),
+        Ok(outcome) => outcome,
+        Err(error) => Outcome::Reply(error_reply(&error.message())),
     }
 }
 
@@ -243,13 +304,15 @@ impl Command {
                 Ok([key]) => Ok(Command::LLen { key }),
                 Err(_) => Err(CommandError::WrongArity("llen")),
             },
+            b"BLPOP" => parse_blocking_pop(args, End::Left, "blpop", now),
+            b"BRPOP" => parse_blocking_pop(args, End::Right, "brpop", now),
             _ => Err(CommandError::Unknown { name, args }),
         }
     }
 
     /// 저장소가 필요한 커맨드만 락을 잡습니다. 락은 각 갈래 안의 `entries`가 사라질 때 풀립니다.
     /// 키를 읽을 때는 항상 `live`를 거칩니다. 만료된 키는 거기서 지워지고 없는 키로 보입니다.
-    fn execute(self, db: &Db, now: Instant) -> Result<Vec<u8>, CommandError> {
+    fn execute(self, db: &Db, now: Instant) -> Result<Outcome, CommandError> {
         // 성공한 응답은 맨 아래에서 한 번에 `Ok`로 감쌉니다. 실패는 각 갈래에서 `?`로 바로 빠져나갑니다.
         let reply = match self {
             Command::Ping(None) => b"+PONG\r\n".to_vec(),
@@ -271,7 +334,7 @@ impl Command {
                     Some(SetCondition::Xx) => exists,
                 };
                 if !allowed {
-                    return Ok(null_bulk_string());
+                    return Ok(Outcome::Reply(null_bulk_string()));
                 }
                 // key와 value를 복사하지 않고 저장소로 옮깁니다. 있던 값과 TTL은 통째로 바뀝니다.
                 // 있던 값이 리스트여도 따지지 않고 덮어씁니다. SET은 WRONGTYPE을 내지 않습니다.
@@ -313,7 +376,8 @@ impl Command {
                 let mut entries = db.lock();
                 // 이미 지난 시각이면 TTL을 거는 대신 바로 지웁니다. 키가 있었으면 1입니다. (`EXPIRE k 0` → 1)
                 if at <= now {
-                    return Ok(integer(i64::from(entries.remove(&key, now))));
+                    let removed = entries.remove(&key, now);
+                    return Ok(Outcome::Reply(integer(i64::from(removed))));
                 }
                 match entries.live(&key, now) {
                     Some(entry) => {
@@ -364,10 +428,17 @@ impl Command {
                     None => {
                         let mut list = VecDeque::new();
                         push_all(&mut list, values, end);
+                        // 응답할 길이는 넣기를 다 끝낸 이 시점의 길이입니다. 대기자가 가져가는 건 그다음입니다.
+                        // 그래서 대기자가 있어도 `RPUSH q a b c`의 응답은 3입니다.
                         let length = list.len();
-                        let value = Value::List(list);
-                        let expires_at = None;
-                        entries.insert(key, Entry { value, expires_at });
+                        // 대기자는 리스트가 없을 때만 명단에 올라가므로, 넘겨줄 일은 새로 만드는 이 갈래에서만 생깁니다.
+                        hand_off(&mut entries, &key, &mut list);
+                        // 대기자들이 다 가져갔으면 빈 리스트를 저장하지 않습니다.
+                        if !list.is_empty() {
+                            let value = Value::List(list);
+                            let expires_at = None;
+                            entries.insert(key, Entry { value, expires_at });
+                        }
                         length
                     }
                 };
@@ -376,13 +447,10 @@ impl Command {
             Command::Pop { key, end } => {
                 let mut entries = db.lock();
                 let Some(entry) = entries.live(&key, now) else {
-                    return Ok(null_bulk_string());
+                    return Ok(Outcome::Reply(null_bulk_string()));
                 };
                 let list = as_list(&mut entry.value)?;
-                let popped = match end {
-                    End::Left => list.pop_front(),
-                    End::Right => list.pop_back(),
-                };
+                let popped = pop(list, end);
                 // 빈 리스트는 남겨 두지 않습니다. 마지막 원소가 빠졌으면 키도 같이 지웁니다.
                 // 그래서 다시 넣으면 TTL이 없는 새 리스트가 됩니다.
                 if list.is_empty() {
@@ -397,11 +465,11 @@ impl Command {
                 let mut entries = db.lock();
                 // 없는 키는 nil이 아니라 빈 배열입니다.
                 let Some(entry) = entries.live(&key, now) else {
-                    return Ok(array_header(0));
+                    return Ok(Outcome::Reply(array_header(0)));
                 };
                 let list = as_list(&mut entry.value)?;
                 let Some(range) = clamp_range(start, stop, list.len()) else {
-                    return Ok(array_header(0));
+                    return Ok(Outcome::Reply(array_header(0)));
                 };
                 // `range`는 그 구간을 복사하지 않고 차례로 빌려줍니다. 락을 잡은 채 바로 응답 바이트로 씁니다.
                 let items = list.range(range);
@@ -419,8 +487,40 @@ impl Command {
                 };
                 integer(i64::try_from(length).unwrap_or(i64::MAX))
             }
+            Command::BlockingPop {
+                keys,
+                end,
+                deadline,
+            } => {
+                let mut entries = db.lock();
+                // 앞 키부터 보고, 처음으로 차 있는 리스트에서 꺼냅니다. 여기까지는 `LPOP`과 같습니다.
+                for key in &keys {
+                    let Some(entry) = entries.live(key, now) else {
+                        continue;
+                    };
+                    // 차 있는 리스트보다 앞에 문자열 키가 있으면 기다리지 않고 바로 WRONGTYPE입니다.
+                    let list = as_list(&mut entry.value)?;
+                    let popped = pop(list, end);
+                    if list.is_empty() {
+                        entries.remove(key, now);
+                    }
+                    if let Some(value) = popped {
+                        return Ok(Outcome::Reply(key_and_value(key, &value)));
+                    }
+                }
+                // 전부 비어 있습니다. 우편함을 하나 만들어 보내는 쪽은 명단에 걸고, 받는 쪽은 들고 나갑니다.
+                // "비었는지 확인"과 "명단에 올리기"가 같은 락 안이라, 그 사이에 들어온 값을 놓칠 수 없습니다.
+                let (sender, receiver) = mpsc::channel();
+                let id = entries.add_waiter(keys, end, sender);
+                // 여기서 자지 않습니다. `Block`을 들고 돌아가면 이 함수가 끝나면서 락이 풀리고, 자는 건 그다음입니다.
+                return Ok(Outcome::Block(Blocked {
+                    id,
+                    receiver,
+                    deadline,
+                }));
+            }
         };
-        Ok(reply)
+        Ok(Outcome::Reply(reply))
     }
 }
 
@@ -482,6 +582,94 @@ fn parse_push(args: Vec<Vec<u8>>, end: End, name: &'static str) -> Result<Comman
         return Err(CommandError::WrongArity(name));
     }
     Ok(Command::Push { key, values, end })
+}
+
+/// `BLPOP key [key ...] timeout`, `BRPOP key [key ...] timeout`
+fn parse_blocking_pop(
+    mut args: Vec<Vec<u8>>,
+    end: End,
+    name: &'static str,
+    now: Instant,
+) -> Result<Command, CommandError> {
+    // 마지막 인자가 timeout이고 그 앞은 전부 키입니다. 키가 하나는 있어야 합니다.
+    if args.len() < 2 {
+        return Err(CommandError::WrongArity(name));
+    }
+    let Some(timeout) = args.pop() else {
+        return Err(CommandError::WrongArity(name));
+    };
+    // timeout은 키를 보기 전에 확인합니다. 그래서 문자열 키여도 timeout 에러가 먼저 나갑니다.
+    let deadline = parse_timeout(&timeout, now)?;
+    let keys = args;
+    Ok(Command::BlockingPop {
+        keys,
+        end,
+        deadline,
+    })
+}
+
+/// timeout(초)을 "언제까지 기다릴지"로 바꿉니다. 0이면 무한정이라 None입니다.
+/// `0.5` 같은 소수도 받습니다. 진짜 Redis처럼 밀리초로 올림해서 `0.0001`은 1ms를 기다립니다.
+fn parse_timeout(bytes: &[u8], now: Instant) -> Result<Option<Instant>, CommandError> {
+    let seconds: f64 = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        // Rust의 `parse`는 "nan"도 숫자로 받아 주지만 진짜 Redis는 거부합니다.
+        .filter(|seconds: &f64| !seconds.is_nan())
+        .ok_or(CommandError::TimeoutNotFloat)?;
+    let millis = (seconds * 1000.0).ceil();
+    if millis < 0.0 {
+        return Err(CommandError::TimeoutNegative);
+    }
+    if millis == 0.0 {
+        return Ok(None);
+    }
+    // `Duration::from_secs_f64`는 무한대나 너무 큰 값에서 패닉합니다. `try_`가 붙은 쪽은 에러를 돌려줍니다.
+    let duration = Duration::try_from_secs_f64(millis / 1000.0)
+        .map_err(|_| CommandError::TimeoutOutOfRange)?;
+    // 진짜 Redis는 밀리초를 i64에 담습니다. 거기 안 들어가는 timeout은 거부합니다.
+    i64::try_from(duration.as_millis()).map_err(|_| CommandError::TimeoutOutOfRange)?;
+    let deadline = now
+        .checked_add(duration)
+        .ok_or(CommandError::TimeoutOutOfRange)?;
+    Ok(Some(deadline))
+}
+
+fn pop(list: &mut VecDeque<Vec<u8>>, end: End) -> Option<Vec<u8>> {
+    match end {
+        End::Left => list.pop_front(),
+        End::Right => list.pop_back(),
+    }
+}
+
+/// 방금 넣은 값을 기다리던 대기자들에게 먼저 온 순서대로 하나씩 넘깁니다.
+/// 넣는 쪽이 락을 쥔 채로 직접 넘기기 때문에, 대기자가 깨어나는 사이에 다른 커넥션의 `LPOP`이 가로챌 수 없습니다.
+fn hand_off(entries: &mut Entries, key: &[u8], list: &mut VecDeque<Vec<u8>>) {
+    while !list.is_empty() {
+        let Some(waiter) = entries.take_waiter(key) else {
+            return;
+        };
+        let end = waiter.end();
+        let Some(value) = pop(list, end) else {
+            return;
+        };
+        // 대기자의 응답에 키 이름이 들어가야 해서 복사해 보냅니다. 원본은 저장소의 키로 쓰여야 합니다.
+        if let Err(value) = waiter.deliver(key.to_vec(), value) {
+            // 받는 쪽이 사라진 대기자입니다. 값을 꺼낸 자리에 되돌려 놓고 다음 대기자를 봅니다.
+            match end {
+                End::Left => list.push_front(value),
+                End::Right => list.push_back(value),
+            }
+        }
+    }
+}
+
+/// `BLPOP`/`BRPOP`의 응답입니다. 어느 키에서 꺼냈는지와 값, 두 칸짜리 배열입니다.
+fn key_and_value(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut reply = array_header(2);
+    reply.extend_from_slice(&bulk_string(key));
+    reply.extend_from_slice(&bulk_string(value));
+    reply
 }
 
 /// 값을 인자 순서대로 하나씩 넣습니다. 그래서 `LPUSH q a b c`는 a, b, c 순으로 왼쪽에 들어가 c가 맨 앞이 됩니다.
@@ -619,6 +807,9 @@ impl CommandError {
             CommandError::WrongType => {
                 b"WRONGTYPE Operation against a key holding the wrong kind of value".to_vec()
             }
+            CommandError::TimeoutNotFloat => b"ERR timeout is not a float or out of range".to_vec(),
+            CommandError::TimeoutNegative => b"ERR timeout is negative".to_vec(),
+            CommandError::TimeoutOutOfRange => b"ERR timeout is out of range".to_vec(),
         }
     }
 }
@@ -626,6 +817,7 @@ impl CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn words(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|part| part.as_bytes().to_vec()).collect()
@@ -633,17 +825,21 @@ mod tests {
 
     /// 저장소를 쓰지 않는 커맨드용입니다. 매번 빈 저장소로 실행합니다.
     fn run(parts: &[&str]) -> Vec<u8> {
-        build_reply(words(parts), &Db::default(), Instant::now())
+        run_on(&Db::default(), parts)
     }
 
     /// 같은 저장소에 커맨드를 이어서 보냅니다.
     fn run_on(db: &Db, parts: &[&str]) -> Vec<u8> {
-        build_reply(words(parts), db, Instant::now())
+        run_at(db, Instant::now(), parts)
     }
 
     /// 시각을 정해서 보냅니다. `start + 200초`를 넘기면 sleep 없이 "200초 뒤"가 됩니다.
+    /// 커넥션이 하는 것처럼, `BLPOP`이 기다려야 하면 이 스레드가 응답이 나올 때까지 기다립니다.
     fn run_at(db: &Db, now: Instant, parts: &[&str]) -> Vec<u8> {
-        build_reply(words(parts), db, now)
+        match build_reply(words(parts), db, now) {
+            Outcome::Reply(reply) => reply,
+            Outcome::Block(blocked) => blocked.wait(db),
+        }
     }
 
     fn after(start: Instant, millis: u64) -> Instant {
@@ -1328,6 +1524,346 @@ mod tests {
             run_on(&db, &["LLEN", "q"]),
             format!(":{left}\r\n").into_bytes()
         );
+    }
+
+    /// 대기자가 `count`명이 될 때까지 기다립니다. sleep으로 어림잡지 않고 명단을 직접 봅니다.
+    fn wait_for_waiters(db: &Db, count: usize) {
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while db.lock().waiter_count() != count {
+            assert!(
+                Instant::now() < give_up,
+                "대기자가 {count}명이 되지 않았습니다"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn blpop은_차_있으면_바로_키와_값을_답한다() {
+        let db = Db::default();
+        run_on(&db, &["RPUSH", "q", "a", "b", "c"]);
+        assert_eq!(
+            run_on(&db, &["BLPOP", "q", "0"]),
+            b"*2\r\n$1\r\nq\r\n$1\r\na\r\n"
+        );
+        assert_eq!(
+            run_on(&db, &["brpop", "q", "0"]),
+            b"*2\r\n$1\r\nq\r\n$1\r\nc\r\n"
+        );
+        // 앞 키가 비어 있으면 다음 키에서 꺼내고, 응답에 그 키 이름이 들어갑니다
+        assert_eq!(
+            run_on(&db, &["BLPOP", "nope", "q", "5"]),
+            b"*2\r\n$1\r\nq\r\n$1\r\nb\r\n"
+        );
+        // 마지막 원소를 꺼냈으니 키도 사라집니다
+        assert_eq!(run_on(&db, &["EXISTS", "q"]), b":0\r\n");
+        assert_eq!(db.lock().waiter_count(), 0);
+    }
+
+    #[test]
+    fn 시간이_다_되면_nil_배열이고_명단에서_빠진다() {
+        // `LPOP`의 nil(`$-1`), 빈 배열(`*0`)과 바이트가 다릅니다. difftest에서는 셋 다 빈 줄입니다.
+        let db = Db::default();
+        let start = Instant::now();
+        assert_eq!(run_on(&db, &["BLPOP", "q", "0.05"]), b"*-1\r\n");
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert_eq!(run_on(&db, &["BRPOP", "a", "b", "0.01"]), b"*-1\r\n");
+        assert_eq!(db.lock().waiter_count(), 0);
+        // 떠난 대기자에게는 넘기지 않습니다. 값은 리스트에 남습니다
+        assert_eq!(run_on(&db, &["RPUSH", "q", "late"]), b":1\r\n");
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q", "0", "-1"]),
+            b"*1\r\n$4\r\nlate\r\n"
+        );
+    }
+
+    #[test]
+    fn timeout_에러_문구가_진짜_redis와_같다() {
+        let not_float = b"-ERR timeout is not a float or out of range\r\n".to_vec();
+        let negative = b"-ERR timeout is negative\r\n".to_vec();
+        let out_of_range = b"-ERR timeout is out of range\r\n".to_vec();
+        let db = Db::default();
+        // 문자열 키여도 timeout 에러가 WRONGTYPE보다 먼저입니다
+        run_on(&db, &["SET", "s", "str"]);
+        for key in ["q", "s"] {
+            for bad in ["abc", "", "nan", "NaN", " 1", "1 ", "1_0", "1,5"] {
+                assert_eq!(run_on(&db, &["BLPOP", key, bad]), not_float, "{bad:?}");
+            }
+            for bad in ["-1", "-0.5", "-inf"] {
+                assert_eq!(run_on(&db, &["BLPOP", key, bad]), negative, "{bad:?}");
+            }
+            for bad in ["inf", "Infinity", "1e16", "9223372036854776"] {
+                assert_eq!(run_on(&db, &["BRPOP", key, bad]), out_of_range, "{bad:?}");
+            }
+        }
+        assert_eq!(db.lock().waiter_count(), 0);
+    }
+
+    #[test]
+    fn timeout은_소수와_여러_표기를_받는다() {
+        // 리스트가 차 있어서 기다리지 않고 바로 답합니다. 에러가 아니면 통과입니다.
+        let db = Db::default();
+        let accepted = [
+            "0", "0.5", "+1", "1.", ".5", "1e0", "1E0", "-0", "-0.0", "00.5", "0.0001", "1e-9",
+            "5e-324", "1e15",
+            // 밀리초로 올림하면 0이라 음수로 보지 않습니다. 진짜 Redis도 받습니다
+            "-1e-9",
+        ];
+        for timeout in accepted {
+            run_on(&db, &["RPUSH", "q", "v"]);
+            assert_eq!(
+                run_on(&db, &["BLPOP", "q", timeout]),
+                b"*2\r\n$1\r\nq\r\n$1\r\nv\r\n",
+                "{timeout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 문자열_키를_만나면_기다리지_않고_wrongtype이다() {
+        let db = Db::default();
+        run_on(&db, &["SET", "s", "str"]);
+        assert_eq!(run_on(&db, &["BLPOP", "s", "0"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["BRPOP", "s", "0"]), WRONGTYPE);
+        // 앞 키가 비어 있어도 뒤의 문자열 키에서 걸립니다
+        assert_eq!(run_on(&db, &["BLPOP", "empty", "s", "0"]), WRONGTYPE);
+        run_on(&db, &["RPUSH", "l", "v1", "v2"]);
+        // 차 있는 리스트가 문자열 키보다 앞이면 거기서 꺼내고 끝납니다
+        assert_eq!(
+            run_on(&db, &["BLPOP", "l", "s", "0"]),
+            b"*2\r\n$1\r\nl\r\n$2\r\nv1\r\n"
+        );
+        assert_eq!(run_on(&db, &["BLPOP", "s", "l", "0"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["LLEN", "l"]), b":1\r\n");
+        assert_eq!(db.lock().waiter_count(), 0);
+    }
+
+    #[test]
+    fn blpop_인자_개수_에러() {
+        let wrong = |name: &str| {
+            format!("-ERR wrong number of arguments for '{name}' command\r\n").into_bytes()
+        };
+        assert_eq!(run(&["BLPOP"]), wrong("blpop"));
+        assert_eq!(run(&["BLPOP", "q"]), wrong("blpop"));
+        assert_eq!(run(&["BRPOP"]), wrong("brpop"));
+        assert_eq!(run(&["BRPOP", "q"]), wrong("brpop"));
+    }
+
+    #[test]
+    fn 먼저_기다린_사람이_먼저_받는다() {
+        // 로드맵의 S07 완료 기준입니다. 손님이 여럿이라 difftest로는 볼 수 없습니다.
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| run_on(&db, &["BLPOP", "q", "0"]));
+            wait_for_waiters(&db, 1);
+            let second = scope.spawn(|| run_on(&db, &["BLPOP", "q", "0"]));
+            wait_for_waiters(&db, 2);
+
+            // 넣은 직후의 길이를 답하고, 그다음에 대기자가 가져갑니다
+            assert_eq!(run_on(&db, &["RPUSH", "q", "one"]), b":1\r\n");
+            assert_eq!(first.join().unwrap(), b"*2\r\n$1\r\nq\r\n$3\r\none\r\n");
+            // 두 번째 대기자는 아직 자고 있습니다
+            assert_eq!(db.lock().waiter_count(), 1);
+            assert!(!second.is_finished());
+
+            assert_eq!(run_on(&db, &["RPUSH", "q", "two"]), b":1\r\n");
+            assert_eq!(second.join().unwrap(), b"*2\r\n$1\r\nq\r\n$3\r\ntwo\r\n");
+        });
+        assert_eq!(run_on(&db, &["EXISTS", "q"]), b":0\r\n");
+    }
+
+    #[test]
+    fn 넣기를_다_끝낸_다음에_대기자에게_넘긴다() {
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            // RPUSH a b c: 응답은 3이고, 대기자는 맨 앞 a를 받고, b c가 남습니다
+            let waiter = scope.spawn(|| run_on(&db, &["BLPOP", "r", "0"]));
+            wait_for_waiters(&db, 1);
+            assert_eq!(run_on(&db, &["RPUSH", "r", "a", "b", "c"]), b":3\r\n");
+            assert_eq!(waiter.join().unwrap(), b"*2\r\n$1\r\nr\r\n$1\r\na\r\n");
+            assert_eq!(
+                run_on(&db, &["LRANGE", "r", "0", "-1"]),
+                b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+            );
+
+            // LPUSH a b c: 다 넣으면 [c b a]라서 대기자는 a가 아니라 c를 받습니다
+            let waiter = scope.spawn(|| run_on(&db, &["BLPOP", "l", "0"]));
+            wait_for_waiters(&db, 1);
+            assert_eq!(run_on(&db, &["LPUSH", "l", "a", "b", "c"]), b":3\r\n");
+            assert_eq!(waiter.join().unwrap(), b"*2\r\n$1\r\nl\r\n$1\r\nc\r\n");
+            assert_eq!(
+                run_on(&db, &["LRANGE", "l", "0", "-1"]),
+                b"*2\r\n$1\r\nb\r\n$1\r\na\r\n"
+            );
+        });
+    }
+
+    #[test]
+    fn blpop과_brpop_대기자는_각자_자기_끝에서_받는다() {
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            let left = scope.spawn(|| run_on(&db, &["BLPOP", "q", "0"]));
+            wait_for_waiters(&db, 1);
+            let right = scope.spawn(|| run_on(&db, &["BRPOP", "q", "0"]));
+            wait_for_waiters(&db, 2);
+            assert_eq!(run_on(&db, &["RPUSH", "q", "1", "2", "3"]), b":3\r\n");
+            assert_eq!(left.join().unwrap(), b"*2\r\n$1\r\nq\r\n$1\r\n1\r\n");
+            assert_eq!(right.join().unwrap(), b"*2\r\n$1\r\nq\r\n$1\r\n3\r\n");
+        });
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q", "0", "-1"]),
+            b"*1\r\n$1\r\n2\r\n"
+        );
+    }
+
+    #[test]
+    fn 대기자가_있으면_넣은_값을_다른_커맨드가_가로채지_못한다() {
+        // 진짜 Redis에 `RPUSH q x`와 `LPOP q`를 붙여 보내면 LPOP은 nil이고 대기자가 x를 받습니다.
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| run_on(&db, &["BLPOP", "q", "0"]));
+            wait_for_waiters(&db, 1);
+            assert_eq!(run_on(&db, &["RPUSH", "q", "x"]), b":1\r\n");
+            // 대기자 스레드가 깨어났는지와 상관없이, RPUSH가 끝난 시점에 x는 이미 넘어가 있습니다
+            assert_eq!(run_on(&db, &["LPOP", "q"]), b"$-1\r\n");
+            assert_eq!(run_on(&db, &["EXISTS", "q"]), b":0\r\n");
+            assert_eq!(waiter.join().unwrap(), b"*2\r\n$1\r\nq\r\n$1\r\nx\r\n");
+        });
+    }
+
+    #[test]
+    fn 여러_키를_기다리다_한_곳에서_받으면_다른_줄에서도_빠진다() {
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            // 첫 대기자는 q1과 q2 두 줄에 다 서고, 둘째 대기자는 q1 줄에서 그 뒤에 섭니다.
+            let both = scope.spawn(|| run_on(&db, &["BLPOP", "q1", "q2", "0"]));
+            wait_for_waiters(&db, 1);
+            let behind = scope.spawn(|| run_on(&db, &["BLPOP", "q1", "2"]));
+            wait_for_waiters(&db, 2);
+
+            assert_eq!(run_on(&db, &["RPUSH", "q2", "x"]), b":1\r\n");
+            assert_eq!(both.join().unwrap(), b"*2\r\n$2\r\nq2\r\n$1\r\nx\r\n");
+            // 첫 대기자의 이름이 q1 줄 앞에 남아 있으면, 이 값이 둘째 대기자에게 가지 못합니다.
+            assert_eq!(run_on(&db, &["RPUSH", "q1", "y"]), b":1\r\n");
+            assert_eq!(behind.join().unwrap(), b"*2\r\n$2\r\nq1\r\n$1\r\ny\r\n");
+        });
+        assert_eq!(db.lock().waiter_count(), 0);
+        // 둘 다 떠난 뒤에 넣은 값은 리스트에 남습니다
+        assert_eq!(run_on(&db, &["RPUSH", "q1", "z"]), b":1\r\n");
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q1", "0", "-1"]),
+            b"*1\r\n$1\r\nz\r\n"
+        );
+    }
+
+    #[test]
+    fn 시간이_다_된_순간에_넘겨받은_값도_사라지지_않는다() {
+        // 대기자의 시간이 다 된 뒤, 명단에서 이름을 지우기 전에 넣는 쪽이 값을 넘기는 장면을 만듭니다.
+        // 테스트가 락을 쥐고 있어서, 깨어난 대기자는 이름을 지우러 락 앞에서 기다리게 됩니다.
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| run_on(&db, &["BLPOP", "q", "0.05"]));
+            wait_for_waiters(&db, 1);
+            let mut entries = db.lock();
+            std::thread::sleep(Duration::from_millis(150));
+            // 넣는 쪽이 락 안에서 하는 일을 그대로 합니다
+            let mut list = VecDeque::from([b"x".to_vec()]);
+            hand_off(&mut entries, b"q", &mut list);
+            assert!(list.is_empty());
+            drop(entries);
+            // 넣는 쪽은 넘겼다고 알고 있으니, 대기자가 nil을 답하면 x는 아무도 못 받고 사라집니다.
+            assert_eq!(waiter.join().unwrap(), b"*2\r\n$1\r\nq\r\n$1\r\nx\r\n");
+        });
+        assert_eq!(db.lock().waiter_count(), 0);
+    }
+
+    #[test]
+    fn 같은_키를_두_번_적어도_한_번만_받는다() {
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| run_on(&db, &["BLPOP", "q", "q", "0"]));
+            wait_for_waiters(&db, 1);
+            assert_eq!(run_on(&db, &["RPUSH", "q", "a", "b"]), b":2\r\n");
+            assert_eq!(waiter.join().unwrap(), b"*2\r\n$1\r\nq\r\n$1\r\na\r\n");
+        });
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q", "0", "-1"]),
+            b"*1\r\n$1\r\nb\r\n"
+        );
+    }
+
+    #[test]
+    fn 기다리는_키에_문자열이_와도_계속_기다린다() {
+        let db = Db::default();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| run_on(&db, &["BLPOP", "z", "0"]));
+            wait_for_waiters(&db, 1);
+            assert_eq!(run_on(&db, &["SET", "z", "str"]), b"+OK\r\n");
+            // 에러를 받고 깨어나지 않습니다
+            assert_eq!(db.lock().waiter_count(), 1);
+            assert!(!waiter.is_finished());
+            assert_eq!(run_on(&db, &["DEL", "z"]), b":1\r\n");
+            assert_eq!(run_on(&db, &["RPUSH", "z", "v"]), b":1\r\n");
+            assert_eq!(waiter.join().unwrap(), b"*2\r\n$1\r\nz\r\n$1\r\nv\r\n");
+        });
+    }
+
+    #[test]
+    fn 받는_쪽이_사라진_대기자는_건너뛰고_값을_남긴다() {
+        let db = Db::default();
+        // 명단에는 올라갔는데 `wait`도 `cancel`도 하지 않고 사라진 대기자를 만듭니다.
+        let outcome = build_reply(words(&["BLPOP", "q", "0"]), &db, Instant::now());
+        assert!(matches!(outcome, Outcome::Block(_)));
+        drop(outcome);
+        assert_eq!(run_on(&db, &["RPUSH", "q", "a", "b"]), b":2\r\n");
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q", "0", "-1"]),
+            b"*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(db.lock().waiter_count(), 0);
+    }
+
+    #[test]
+    fn 넣는_쪽과_기다리는_쪽이_섞여도_빠지거나_겹치는_값이_없다() {
+        // 기다리는 쪽이 1ms마다 시간이 다 돼서, "시간이 다 된 순간에 값이 도착"하는 장면이 계속 생깁니다.
+        // 그때 값이 사라지면 받은 개수가 모자라고, 두 번 주면 겹칩니다.
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: usize = 250;
+        let total = PRODUCERS * PER_PRODUCER;
+        let db = Db::default();
+        let received = Mutex::new(Vec::new());
+        let give_up = Instant::now() + Duration::from_secs(10);
+        std::thread::scope(|scope| {
+            for producer in 0..PRODUCERS {
+                let db = &db;
+                scope.spawn(move || {
+                    for number in 0..PER_PRODUCER {
+                        let value = format!("{producer}-{number}");
+                        run_on(db, &["RPUSH", "q", &value]);
+                    }
+                });
+            }
+            for consumer in 0..4 {
+                let (db, received) = (&db, &received);
+                // 절반은 앞에서, 절반은 뒤에서 꺼냅니다
+                let name = if consumer % 2 == 0 { "BLPOP" } else { "BRPOP" };
+                scope.spawn(move || {
+                    while received.lock().unwrap().len() < total && Instant::now() < give_up {
+                        let reply = run_on(db, &[name, "q", "0.001"]);
+                        if reply != b"*-1\r\n" {
+                            received.lock().unwrap().push(reply);
+                        }
+                    }
+                });
+            }
+        });
+        let mut received = received.into_inner().unwrap();
+        assert_eq!(received.len(), total);
+        received.sort();
+        received.dedup();
+        assert_eq!(received.len(), total, "같은 값을 두 번 받았습니다");
+        assert_eq!(run_on(&db, &["LLEN", "q"]), b":0\r\n");
+        assert_eq!(db.lock().waiter_count(), 0);
     }
 
     #[test]
