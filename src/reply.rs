@@ -12,6 +12,11 @@ pub fn null_bulk_string() -> Vec<u8> {
     b"$-1\r\n".to_vec()
 }
 
+/// 배열의 머리입니다. 원소는 이 뒤에 하나씩 이어 붙입니다. 원소가 없으면 빈 배열(`*0\r\n`)입니다.
+pub fn array_header(count: usize) -> Vec<u8> {
+    format!("*{count}\r\n").into_bytes()
+}
+
 pub fn integer(value: i64) -> Vec<u8> {
     format!(":{value}\r\n").into_bytes()
 }

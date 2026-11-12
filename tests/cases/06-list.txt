@@ -1,0 +1,183 @@
+# 세션 6: LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN
+#
+# 주의: redis-cli 출력을 비교하므로 nil 문자열 $-1, 빈 배열 *0 이 둘 다 빈 줄로 보입니다.
+#       정수 :3 과 문자열 $1 3 도 구분되지 않습니다.
+#       줄을 공백으로 쪼개서 보내므로 빈 값도 여기 못 넣습니다.
+#       셋 다 src/command.rs 의 단위 테스트에 바이트로 있습니다.
+#       키 이름은 전부 l6: 로 시작합니다. 앞 파일이 남긴 키와 타입이 부딪히지 않게 하려는 것입니다.
+
+# LPUSH는 하나씩 왼쪽에 넣어서 마지막 인자가 맨 앞에 옵니다
+LPUSH l6:q a b c
+RPUSH l6:q x
+LRANGE l6:q 0 -1
+LLEN l6:q
+
+# 양 끝에서 하나씩 뺍니다
+LPOP l6:q
+RPOP l6:q
+LRANGE l6:q 0 -1
+LLEN l6:q
+
+# 없는 키: 길이는 0, 꺼내면 nil, 범위는 빈 배열
+LLEN l6:nope
+LPOP l6:nope
+RPOP l6:nope
+LRANGE l6:nope 0 -1
+EXISTS l6:nope
+
+# LRANGE 번호: 음수는 뒤에서 세고, 끝 번호도 포함입니다
+RPUSH l6:n 1 2 3 4 5 6 7 8 9 10 11 12
+LRANGE l6:n 0 -1
+LRANGE l6:n 0 0
+LRANGE l6:n 5 5
+LRANGE l6:n -3 -1
+LRANGE l6:n -2 -1
+LRANGE l6:n 1 -2
+
+# 범위를 넘으면 에러가 아니라 잘라서 줍니다
+LRANGE l6:n 0 100
+LRANGE l6:n 10 20
+LRANGE l6:n -100 100
+LRANGE l6:n -13 0
+
+# 걸리는 게 없으면 빈 배열입니다
+LRANGE l6:n 3 1
+LRANGE l6:n 12 20
+LRANGE l6:n -1 -2
+LRANGE l6:n -20 -13
+
+# i64 양 끝
+LRANGE l6:n -9223372036854775808 9223372036854775807
+LRANGE l6:n 9223372036854775807 -9223372036854775808
+LRANGE l6:n -9223372036854775808 -9223372036854775808
+LRANGE l6:n 9223372036854775807 9223372036854775807
+
+# 번호가 정수가 아닐 때
+LRANGE l6:n abc 1
+LRANGE l6:n 0 abc
+LRANGE l6:n 0 1.5
+LRANGE l6:n +0 1
+LRANGE l6:n 9223372036854775808 1
+LRANGE l6:n 0 -9223372036854775809
+
+# 마지막 원소를 빼면 키도 사라집니다
+RPUSH l6:e a
+LPOP l6:e
+EXISTS l6:e
+LLEN l6:e
+LPOP l6:e
+RPUSH l6:e a b
+RPOP l6:e
+RPOP l6:e
+EXISTS l6:e
+
+# 문자열 키에 리스트 커맨드를 쓰면 WRONGTYPE
+SET l6:s hello
+LPUSH l6:s a
+RPUSH l6:s a
+LPOP l6:s
+RPOP l6:s
+LLEN l6:s
+LRANGE l6:s 0 -1
+GET l6:s
+
+# 리스트 키에 문자열 커맨드를 써도 WRONGTYPE. 리스트는 그대로입니다
+RPUSH l6:l a
+GET l6:l
+INCR l6:l
+DECR l6:l
+INCRBY l6:l 1
+LRANGE l6:l 0 -1
+
+# 인자 에러가 타입 에러보다 먼저입니다
+LRANGE l6:s abc 1
+LRANGE l6:s 0
+LPUSH l6:s
+INCRBY l6:l abc
+
+# 타입을 안 따지는 커맨드: EXISTS, TTL, EXPIRE, PERSIST, DEL, SET
+EXISTS l6:l
+TTL l6:l
+EXPIRE l6:l 100
+TTL l6:l
+PERSIST l6:l
+TTL l6:l
+SET l6:l v NX
+LRANGE l6:l 0 -1
+SET l6:l v XX
+GET l6:l
+LLEN l6:l
+RPUSH l6:d a b
+DEL l6:d
+EXISTS l6:d
+
+# TTL은 넣고 빼도 그대로이고, 비어서 지워졌다 다시 생기면 없습니다
+RPUSH l6:t a
+EXPIRE l6:t 100
+RPUSH l6:t b
+LPUSH l6:t c
+TTL l6:t
+LPOP l6:t
+TTL l6:t
+LPOP l6:t
+LPOP l6:t
+TTL l6:t
+RPUSH l6:t d
+TTL l6:t
+
+# 만료된 리스트는 없는 키입니다. 다시 넣으면 새 리스트입니다
+RPUSH l6:x old1 old2
+EXPIRE l6:x 0
+EXISTS l6:x
+SET l6:pxs v PX 100
+SLEEP 0.3
+RPUSH l6:pxs new
+LRANGE l6:pxs 0 -1
+TTL l6:pxs
+
+# 대소문자
+lpush l6:c a
+RpUsH l6:c b
+lrange l6:c 0 -1
+llen l6:c
+rpop l6:c
+lpop l6:c
+
+# 인자 개수
+LPUSH
+LPUSH l6:a
+RPUSH
+RPUSH l6:a
+LPOP
+RPOP
+LLEN
+LLEN l6:a l6:b
+LRANGE
+LRANGE l6:a
+LRANGE l6:a 0
+LRANGE l6:a 0 1 2
+LRANGE l6:a abc 1 2
+EXISTS l6:a
+
+# 로드맵의 작업 큐 장면: 왼쪽에 넣고 오른쪽에서 꺼내면 먼저 넣은 것이 먼저 나옵니다
+LPUSH l6:mail m1
+LPUSH l6:mail m2
+LPUSH l6:mail m3
+LLEN l6:mail
+LRANGE l6:mail -2 -1
+RPUSH l6:mail reset
+RPOP l6:mail
+RPOP l6:mail
+LPOP l6:mail
+LRANGE l6:mail 0 -1
+
+# S01 ~ S05 가 깨지지 않았는지
+PING
+ECHO hello
+SET l6:k 10
+INCR l6:k
+GET l6:k
+
+# 이 파일이 남긴 키를 지웁니다. 우리 서버는 FLUSHALL이 없어서, 남겨 두면 다음 파일의 DBSIZE가 깨집니다
+DEL l6:q l6:n l6:s l6:l l6:t l6:pxs l6:mail l6:k
+DBSIZE

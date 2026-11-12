@@ -1,9 +1,11 @@
 //! 파싱된 명령(인자 목록)을 커맨드로 바꾸고, 실행해서 응답 바이트를 만듭니다.
 
+use std::collections::VecDeque;
+use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-use crate::db::{Db, Entries, Entry};
-use crate::reply::{bulk_string, error_reply, integer, null_bulk_string};
+use crate::db::{Db, Entries, Entry, Value};
+use crate::reply::{array_header, bulk_string, error_reply, integer, null_bulk_string};
 
 /// 인자 개수 검사를 통과한 커맨드입니다.
 /// 인자를 복사하지 않고 넘겨받아(소유해서) 들고 있습니다.
@@ -42,6 +44,33 @@ enum Command {
         key: Vec<u8>,
         delta: i64,
     },
+    /// `LPUSH`와 `RPUSH`입니다. 값이 하나 이상 들어 있습니다.
+    Push {
+        key: Vec<u8>,
+        values: Vec<Vec<u8>>,
+        end: End,
+    },
+    /// `LPOP`과 `RPOP`입니다.
+    Pop {
+        key: Vec<u8>,
+        end: End,
+    },
+    /// 번호는 음수일 수 있습니다. 실제 범위는 리스트 길이를 알아야 정해져서 `execute`에서 계산합니다.
+    LRange {
+        key: Vec<u8>,
+        start: i64,
+        stop: i64,
+    },
+    LLen {
+        key: Vec<u8>,
+    },
+}
+
+/// 리스트의 어느 쪽 끝인지입니다. `L`로 시작하는 커맨드는 왼쪽(앞), `R`은 오른쪽(뒤)입니다.
+#[derive(Clone, Copy)]
+enum End {
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -76,6 +105,8 @@ enum CommandError {
     InvalidExpireTime(&'static str),
     /// `EXPIRE` 뒤에 붙은 옵션입니다. 옵션(NX/XX/GT/LT)은 이번 범위가 아니라 전부 여기로 옵니다.
     UnsupportedOption(Vec<u8>),
+    /// 문자열 키에 리스트 커맨드를 썼거나 그 반대입니다. 이 에러만 `ERR`로 시작하지 않습니다.
+    WrongType,
 }
 
 /// `now`는 이 명령을 처리하는 시각입니다. 테스트는 여기에 "200초 뒤"를 넘겨서 sleep 없이 만료를 확인합니다.
@@ -86,15 +117,17 @@ pub fn build_reply(command: Vec<Vec<u8>>, db: &Db, now: Instant) -> Vec<u8> {
         return Vec::new();
     };
 
-    match Command::parse(name, parts.collect(), now) {
-        Ok(command) => command.execute(db, now),
+    // `and_then`은 parse가 성공했을 때만 execute를 부릅니다. 어느 쪽에서 실패하든 에러는 여기 한 곳에서 응답으로 바뀝니다.
+    match Command::parse(name, parts.collect(), now).and_then(|command| command.execute(db, now)) {
+        Ok(reply) => reply,
         Err(error) => error_reply(&error.message()),
     }
 }
 
 impl Command {
     /// 인자 개수, 옵션 문법, 인자로 온 숫자는 여기서 전부 확인합니다.
-    /// `execute`에서 나는 에러는 저장된 값을 봐야 알 수 있는 것(`INCR` 계열)뿐입니다.
+    /// `execute`에서 나는 에러는 저장된 값을 봐야 알 수 있는 것(WRONGTYPE, `INCR` 계열의 숫자 에러)뿐입니다.
+    /// 그래서 인자 에러가 언제나 타입 에러보다 먼저 나갑니다. (`LRANGE 문자열키 abc 1` → not an integer)
     fn parse(name: Vec<u8>, args: Vec<Vec<u8>>, now: Instant) -> Result<Command, CommandError> {
         match name.to_ascii_uppercase().as_slice() {
             b"PING" => {
@@ -181,14 +214,44 @@ impl Command {
                 }
                 Err(_) => Err(CommandError::WrongArity("incrby")),
             },
+            b"LPUSH" => parse_push(args, End::Left, "lpush"),
+            b"RPUSH" => parse_push(args, End::Right, "rpush"),
+            // 진짜 Redis는 `LPOP key count`도 받지만 이번 범위가 아니라서 인자 개수 에러로 답합니다.
+            b"LPOP" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::Pop {
+                    key,
+                    end: End::Left,
+                }),
+                Err(_) => Err(CommandError::WrongArity("lpop")),
+            },
+            b"RPOP" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::Pop {
+                    key,
+                    end: End::Right,
+                }),
+                Err(_) => Err(CommandError::WrongArity("rpop")),
+            },
+            b"LRANGE" => match <[Vec<u8>; 3]>::try_from(args) {
+                Ok([key, start, stop]) => {
+                    let start = parse_integer(&start).ok_or(CommandError::NotInteger)?;
+                    let stop = parse_integer(&stop).ok_or(CommandError::NotInteger)?;
+                    Ok(Command::LRange { key, start, stop })
+                }
+                Err(_) => Err(CommandError::WrongArity("lrange")),
+            },
+            b"LLEN" => match <[Vec<u8>; 1]>::try_from(args) {
+                Ok([key]) => Ok(Command::LLen { key }),
+                Err(_) => Err(CommandError::WrongArity("llen")),
+            },
             _ => Err(CommandError::Unknown { name, args }),
         }
     }
 
     /// 저장소가 필요한 커맨드만 락을 잡습니다. 락은 각 갈래 안의 `entries`가 사라질 때 풀립니다.
     /// 키를 읽을 때는 항상 `live`를 거칩니다. 만료된 키는 거기서 지워지고 없는 키로 보입니다.
-    fn execute(self, db: &Db, now: Instant) -> Vec<u8> {
-        match self {
+    fn execute(self, db: &Db, now: Instant) -> Result<Vec<u8>, CommandError> {
+        // 성공한 응답은 맨 아래에서 한 번에 `Ok`로 감쌉니다. 실패는 각 갈래에서 `?`로 바로 빠져나갑니다.
+        let reply = match self {
             Command::Ping(None) => b"+PONG\r\n".to_vec(),
             Command::Ping(Some(message)) => bulk_string(&message),
             Command::Echo(message) => bulk_string(&message),
@@ -208,9 +271,11 @@ impl Command {
                     Some(SetCondition::Xx) => exists,
                 };
                 if !allowed {
-                    return null_bulk_string();
+                    return Ok(null_bulk_string());
                 }
                 // key와 value를 복사하지 않고 저장소로 옮깁니다. 있던 값과 TTL은 통째로 바뀝니다.
+                // 있던 값이 리스트여도 따지지 않고 덮어씁니다. SET은 WRONGTYPE을 내지 않습니다.
+                let value = Value::Str(value);
                 entries.insert(key, Entry { value, expires_at });
                 b"+OK\r\n".to_vec()
             }
@@ -218,7 +283,7 @@ impl Command {
                 let mut entries = db.lock();
                 // 값을 저장소 밖으로 복사해 꺼내지 않고, 락을 잡은 채 바로 응답 바이트로 씁니다.
                 match entries.live(&key, now) {
-                    Some(entry) => bulk_string(&entry.value),
+                    Some(entry) => bulk_string(as_string(&mut entry.value)?),
                     None => null_bulk_string(),
                 }
             }
@@ -248,7 +313,7 @@ impl Command {
                 let mut entries = db.lock();
                 // 이미 지난 시각이면 TTL을 거는 대신 바로 지웁니다. 키가 있었으면 1입니다. (`EXPIRE k 0` → 1)
                 if at <= now {
-                    return integer(i64::from(entries.remove(&key, now)));
+                    return Ok(integer(i64::from(entries.remove(&key, now))));
                 }
                 match entries.live(&key, now) {
                     Some(entry) => {
@@ -285,12 +350,77 @@ impl Command {
                 let mut entries = db.lock();
                 // 읽기, 더하기, 쓰기가 락 한 번 안에서 끝납니다. 앱이 GET → +1 → SET으로 나눠 보내면
                 // 그 사이에 다른 커넥션이 끼어들어 값을 잃어버립니다(lost update). 이걸 막는 게 INCR입니다.
-                match incr_by(&mut entries, key, delta, now) {
-                    Ok(number) => integer(number),
-                    Err(error) => error_reply(&error.message()),
+                integer(incr_by(&mut entries, key, delta, now)?)
+            }
+            Command::Push { key, values, end } => {
+                let mut entries = db.lock();
+                let length = match entries.live(&key, now) {
+                    Some(entry) => {
+                        // 넣고 빼도 `entry.expires_at`은 건드리지 않아서 걸려 있던 TTL이 그대로입니다.
+                        let list = as_list(&mut entry.value)?;
+                        push_all(list, values, end);
+                        list.len()
+                    }
+                    None => {
+                        let mut list = VecDeque::new();
+                        push_all(&mut list, values, end);
+                        let length = list.len();
+                        let value = Value::List(list);
+                        let expires_at = None;
+                        entries.insert(key, Entry { value, expires_at });
+                        length
+                    }
+                };
+                integer(i64::try_from(length).unwrap_or(i64::MAX))
+            }
+            Command::Pop { key, end } => {
+                let mut entries = db.lock();
+                let Some(entry) = entries.live(&key, now) else {
+                    return Ok(null_bulk_string());
+                };
+                let list = as_list(&mut entry.value)?;
+                let popped = match end {
+                    End::Left => list.pop_front(),
+                    End::Right => list.pop_back(),
+                };
+                // 빈 리스트는 남겨 두지 않습니다. 마지막 원소가 빠졌으면 키도 같이 지웁니다.
+                // 그래서 다시 넣으면 TTL이 없는 새 리스트가 됩니다.
+                if list.is_empty() {
+                    entries.remove(&key, now);
+                }
+                match popped {
+                    Some(value) => bulk_string(&value),
+                    None => null_bulk_string(),
                 }
             }
-        }
+            Command::LRange { key, start, stop } => {
+                let mut entries = db.lock();
+                // 없는 키는 nil이 아니라 빈 배열입니다.
+                let Some(entry) = entries.live(&key, now) else {
+                    return Ok(array_header(0));
+                };
+                let list = as_list(&mut entry.value)?;
+                let Some(range) = clamp_range(start, stop, list.len()) else {
+                    return Ok(array_header(0));
+                };
+                // `range`는 그 구간을 복사하지 않고 차례로 빌려줍니다. 락을 잡은 채 바로 응답 바이트로 씁니다.
+                let items = list.range(range);
+                let mut reply = array_header(items.len());
+                for item in items {
+                    reply.extend_from_slice(&bulk_string(item));
+                }
+                reply
+            }
+            Command::LLen { key } => {
+                let mut entries = db.lock();
+                let length = match entries.live(&key, now) {
+                    Some(entry) => as_list(&mut entry.value)?.len(),
+                    None => 0,
+                };
+                integer(i64::try_from(length).unwrap_or(i64::MAX))
+            }
+        };
+        Ok(reply)
     }
 }
 
@@ -305,7 +435,7 @@ fn incr_by(
 ) -> Result<i64, CommandError> {
     let Some(entry) = entries.live(&key, now) else {
         // 없는 키(만료된 키 포함)는 0에서 시작합니다. 0 + delta는 넘칠 수 없습니다.
-        let value = delta.to_string().into_bytes();
+        let value = Value::Str(delta.to_string().into_bytes());
         entries.insert(
             key,
             Entry {
@@ -315,10 +445,70 @@ fn incr_by(
         );
         return Ok(delta);
     };
-    let current = parse_integer(&entry.value).ok_or(CommandError::NotInteger)?;
+    let bytes = as_string(&mut entry.value)?;
+    let current = parse_integer(bytes).ok_or(CommandError::NotInteger)?;
     let next = current.checked_add(delta).ok_or(CommandError::Overflow)?;
-    entry.value = next.to_string().into_bytes();
+    // `bytes`는 저장소 안의 값을 가리키는 빌림입니다. `*`로 그 자리에 새 값을 써넣습니다.
+    *bytes = next.to_string().into_bytes();
     Ok(next)
+}
+
+/// 문자열 커맨드가 값을 꺼낼 때 거칩니다. 리스트가 들어 있으면 WRONGTYPE입니다.
+/// 값 종류가 늘면 이 `match`가 컴파일 에러를 내서, 새 종류를 어떻게 할지 여기서 정하게 됩니다.
+fn as_string(value: &mut Value) -> Result<&mut Vec<u8>, CommandError> {
+    match value {
+        Value::Str(bytes) => Ok(bytes),
+        Value::List(_) => Err(CommandError::WrongType),
+    }
+}
+
+/// 리스트 커맨드가 값을 꺼낼 때 거칩니다. 문자열이 들어 있으면 WRONGTYPE입니다.
+fn as_list(value: &mut Value) -> Result<&mut VecDeque<Vec<u8>>, CommandError> {
+    match value {
+        Value::List(list) => Ok(list),
+        Value::Str(_) => Err(CommandError::WrongType),
+    }
+}
+
+/// `LPUSH key value [value ...]`, `RPUSH key value [value ...]`
+fn parse_push(args: Vec<Vec<u8>>, end: End, name: &'static str) -> Result<Command, CommandError> {
+    let mut args = args.into_iter();
+    let Some(key) = args.next() else {
+        return Err(CommandError::WrongArity(name));
+    };
+    // 키 뒤에 남은 인자가 전부 값입니다. 하나도 없으면 인자 개수 에러입니다.
+    let values: Vec<Vec<u8>> = args.collect();
+    if values.is_empty() {
+        return Err(CommandError::WrongArity(name));
+    }
+    Ok(Command::Push { key, values, end })
+}
+
+/// 값을 인자 순서대로 하나씩 넣습니다. 그래서 `LPUSH q a b c`는 a, b, c 순으로 왼쪽에 들어가 c가 맨 앞이 됩니다.
+fn push_all(list: &mut VecDeque<Vec<u8>>, values: Vec<Vec<u8>>, end: End) {
+    for value in values {
+        match end {
+            End::Left => list.push_front(value),
+            End::Right => list.push_back(value),
+        }
+    }
+}
+
+/// `LRANGE`의 시작 번호와 끝 번호를 실제로 꺼낼 구간으로 바꿉니다. 끝 번호도 포함입니다.
+/// 음수는 뒤에서 센 번호라 길이를 더해 앞에서 센 번호로 바꾸고, 범위를 넘는 쪽은 잘라 냅니다.
+/// 걸리는 원소가 없으면 None입니다.
+fn clamp_range(start: i64, stop: i64, length: usize) -> Option<RangeInclusive<usize>> {
+    let length = i64::try_from(length).unwrap_or(i64::MAX);
+    // 길이는 0 이상이고 더하는 쪽은 음수라서 이 덧셈은 넘치지 않습니다.
+    let start = if start < 0 { length + start } else { start };
+    let stop = if stop < 0 { length + stop } else { stop };
+    // 앞으로 넘친 시작 번호는 0으로 당깁니다. 끝 번호는 당기지 않아서, 음수로 남으면 아래에서 빈 구간이 됩니다.
+    let start = start.max(0);
+    if start > stop || start >= length {
+        return None;
+    }
+    let stop = stop.min(length - 1);
+    Some(usize::try_from(start).ok()?..=usize::try_from(stop).ok()?)
 }
 
 /// `SET key value [NX | XX] [EX seconds | PX milliseconds]`
@@ -425,6 +615,9 @@ impl CommandError {
                     other => other,
                 }));
                 message
+            }
+            CommandError::WrongType => {
+                b"WRONGTYPE Operation against a key holding the wrong kind of value".to_vec()
             }
         }
     }
@@ -882,6 +1075,259 @@ mod tests {
         let later = after(start, 200_000);
         assert_eq!(run_at(&db, later, &["INCR", "k"]), b":1\r\n");
         assert_eq!(run_at(&db, later, &["TTL", "k"]), b":-1\r\n");
+    }
+
+    const WRONGTYPE: &[u8] =
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+
+    #[test]
+    fn push는_길이를_정수로_답하고_lrange는_배열로_답한다() {
+        let db = Db::default();
+        // a, b, c를 하나씩 왼쪽에 넣어서 c가 맨 앞입니다
+        assert_eq!(run_on(&db, &["LPUSH", "q", "a", "b", "c"]), b":3\r\n");
+        assert_eq!(run_on(&db, &["RPUSH", "q", "x"]), b":4\r\n");
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q", "0", "-1"]),
+            b"*4\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nx\r\n"
+        );
+        assert_eq!(run_on(&db, &["LLEN", "q"]), b":4\r\n");
+        assert_eq!(run_on(&db, &["LPOP", "q"]), b"$1\r\nc\r\n");
+        assert_eq!(run_on(&db, &["RPOP", "q"]), b"$1\r\nx\r\n");
+        assert_eq!(
+            run_on(&db, &["lrange", "q", "0", "-1"]),
+            b"*2\r\n$1\r\nb\r\n$1\r\na\r\n"
+        );
+    }
+
+    #[test]
+    fn 없는_리스트의_nil_모양은_커맨드마다_다르다() {
+        // difftest(redis-cli 출력 비교)에서는 `$-1`, `*0`이 둘 다 빈 줄이라 여기서 바이트로 확인합니다.
+        let db = Db::default();
+        assert_eq!(run_on(&db, &["LPOP", "nope"]), b"$-1\r\n");
+        assert_eq!(run_on(&db, &["RPOP", "nope"]), b"$-1\r\n");
+        assert_eq!(run_on(&db, &["LRANGE", "nope", "0", "-1"]), b"*0\r\n");
+        assert_eq!(run_on(&db, &["LLEN", "nope"]), b":0\r\n");
+        // 읽기만 했으니 키가 생기지 않습니다
+        assert_eq!(run_on(&db, &["DBSIZE"]), b":0\r\n");
+        // 걸리는 게 없는 범위도 빈 배열입니다
+        run_on(&db, &["RPUSH", "q", "a"]);
+        assert_eq!(run_on(&db, &["LRANGE", "q", "3", "1"]), b"*0\r\n");
+    }
+
+    #[test]
+    fn 빈_값도_원소_하나다() {
+        // 줄을 공백으로 쪼개 보내는 difftest 케이스에는 빈 값을 못 넣습니다.
+        let db = Db::default();
+        assert_eq!(run_on(&db, &["LPUSH", "q", ""]), b":1\r\n");
+        assert_eq!(
+            run_on(&db, &["LRANGE", "q", "0", "-1"]),
+            b"*1\r\n$0\r\n\r\n"
+        );
+        assert_eq!(run_on(&db, &["LPOP", "q"]), b"$0\r\n\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "q"]), b":0\r\n");
+    }
+
+    #[test]
+    fn lrange는_음수를_뒤에서_세고_범위_밖은_잘라_낸다() {
+        let db = Db::default();
+        run_on(&db, &["RPUSH", "q", "0", "1", "2", "3"]);
+        // (시작, 끝, 나와야 하는 원소들)
+        let min = "-9223372036854775808";
+        let max = "9223372036854775807";
+        let cases: [(&str, &str, &[&str]); 18] = [
+            ("0", "-1", &["0", "1", "2", "3"]),
+            ("0", "0", &["0"]),
+            ("1", "2", &["1", "2"]),
+            ("-2", "-1", &["2", "3"]),
+            ("1", "-2", &["1", "2"]),
+            ("0", "100", &["0", "1", "2", "3"]),
+            ("-100", "100", &["0", "1", "2", "3"]),
+            ("-5", "0", &["0"]),
+            ("3", "3", &["3"]),
+            ("3", "1", &[]),
+            ("4", "10", &[]),
+            ("-1", "-2", &[]),
+            // 끝 번호가 맨 앞보다도 앞이면 0으로 당기지 않고 빈 배열입니다
+            ("-10", "-5", &[]),
+            ("0", "-5", &[]),
+            (min, max, &["0", "1", "2", "3"]),
+            (max, min, &[]),
+            (min, min, &[]),
+            (max, max, &[]),
+        ];
+        for (start, stop, expected) in cases {
+            let mut reply = format!("*{}\r\n", expected.len());
+            for item in expected {
+                reply.push_str(&format!("${}\r\n{item}\r\n", item.len()));
+            }
+            assert_eq!(
+                run_on(&db, &["LRANGE", "q", start, stop]),
+                reply.into_bytes(),
+                "LRANGE q {start} {stop}"
+            );
+        }
+    }
+
+    #[test]
+    fn 마지막_원소를_빼면_키도_사라진다() {
+        let db = Db::default();
+        run_on(&db, &["RPUSH", "q", "a", "b"]);
+        assert_eq!(run_on(&db, &["LPOP", "q"]), b"$1\r\na\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "q"]), b":1\r\n");
+        assert_eq!(run_on(&db, &["RPOP", "q"]), b"$1\r\nb\r\n");
+        assert_eq!(run_on(&db, &["EXISTS", "q"]), b":0\r\n");
+        assert_eq!(run_on(&db, &["DBSIZE"]), b":0\r\n");
+        assert_eq!(run_on(&db, &["LPOP", "q"]), b"$-1\r\n");
+    }
+
+    #[test]
+    fn 타입이_다르면_wrongtype이고_값은_그대로다() {
+        let db = Db::default();
+        run_on(&db, &["SET", "s", "hello"]);
+        assert_eq!(run_on(&db, &["LPUSH", "s", "a"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["RPUSH", "s", "a"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["LPOP", "s"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["RPOP", "s"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["LLEN", "s"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["LRANGE", "s", "0", "-1"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["GET", "s"]), b"$5\r\nhello\r\n");
+
+        run_on(&db, &["RPUSH", "l", "a"]);
+        assert_eq!(run_on(&db, &["GET", "l"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["INCR", "l"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["DECR", "l"]), WRONGTYPE);
+        assert_eq!(run_on(&db, &["INCRBY", "l", "1"]), WRONGTYPE);
+        assert_eq!(
+            run_on(&db, &["LRANGE", "l", "0", "-1"]),
+            b"*1\r\n$1\r\na\r\n"
+        );
+    }
+
+    #[test]
+    fn 인자_에러가_타입_에러보다_먼저다() {
+        let not_integer = b"-ERR value is not an integer or out of range\r\n".to_vec();
+        let db = Db::default();
+        run_on(&db, &["SET", "s", "hello"]);
+        run_on(&db, &["RPUSH", "l", "a"]);
+        assert_eq!(run_on(&db, &["LRANGE", "s", "abc", "1"]), not_integer);
+        assert_eq!(run_on(&db, &["LRANGE", "s", "0", "1.5"]), not_integer);
+        assert_eq!(run_on(&db, &["INCRBY", "l", "abc"]), not_integer);
+        assert_eq!(
+            run_on(&db, &["LRANGE", "s", "0"]),
+            b"-ERR wrong number of arguments for 'lrange' command\r\n"
+        );
+        assert_eq!(
+            run_on(&db, &["LPUSH", "s"]),
+            b"-ERR wrong number of arguments for 'lpush' command\r\n"
+        );
+    }
+
+    #[test]
+    fn 타입을_안_따지는_커맨드는_리스트에도_그대로_된다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["RPUSH", "l", "a", "b"]);
+        assert_eq!(run_at(&db, start, &["EXISTS", "l"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["TTL", "l"]), b":-1\r\n");
+        assert_eq!(run_at(&db, start, &["EXPIRE", "l", "100"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["PERSIST", "l"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["DBSIZE"]), b":1\r\n");
+        // NX는 리스트 키도 "있는 키"로 봅니다
+        assert_eq!(run_at(&db, start, &["SET", "l", "v", "NX"]), b"$-1\r\n");
+        assert_eq!(run_at(&db, start, &["LLEN", "l"]), b":2\r\n");
+        // SET은 타입을 따지지 않고 덮어씁니다
+        assert_eq!(run_at(&db, start, &["SET", "l", "v"]), b"+OK\r\n");
+        assert_eq!(run_at(&db, start, &["GET", "l"]), b"$1\r\nv\r\n");
+        assert_eq!(run_at(&db, start, &["LLEN", "l"]), WRONGTYPE);
+        run_at(&db, start, &["RPUSH", "d", "a"]);
+        assert_eq!(run_at(&db, start, &["DEL", "d"]), b":1\r\n");
+        assert_eq!(run_at(&db, start, &["EXISTS", "d"]), b":0\r\n");
+    }
+
+    #[test]
+    fn 리스트의_ttl은_넣고_빼도_그대로이고_비면_사라진다() {
+        let db = Db::default();
+        let start = Instant::now();
+        run_at(&db, start, &["RPUSH", "q", "a"]);
+        run_at(&db, start, &["EXPIRE", "q", "100"]);
+        run_at(&db, start, &["RPUSH", "q", "b"]);
+        run_at(&db, start, &["LPUSH", "q", "c"]);
+        run_at(&db, start, &["LPOP", "q"]);
+        assert_eq!(run_at(&db, start, &["TTL", "q"]), b":100\r\n");
+        // 비어서 지워졌다가 다시 생긴 리스트는 새 키라 TTL이 없습니다
+        run_at(&db, start, &["LPOP", "q"]);
+        run_at(&db, start, &["LPOP", "q"]);
+        assert_eq!(run_at(&db, start, &["TTL", "q"]), b":-2\r\n");
+        run_at(&db, start, &["RPUSH", "q", "d"]);
+        assert_eq!(run_at(&db, start, &["TTL", "q"]), b":-1\r\n");
+
+        // 만료된 리스트는 없는 키입니다. 넣으면 옛 원소 없이 새로 시작합니다
+        run_at(&db, start, &["RPUSH", "old", "x", "y"]);
+        run_at(&db, start, &["EXPIRE", "old", "100"]);
+        let later = after(start, 200_000);
+        assert_eq!(run_at(&db, later, &["LLEN", "old"]), b":0\r\n");
+        assert_eq!(run_at(&db, later, &["RPUSH", "old", "z"]), b":1\r\n");
+        assert_eq!(
+            run_at(&db, later, &["LRANGE", "old", "0", "-1"]),
+            b"*1\r\n$1\r\nz\r\n"
+        );
+        assert_eq!(run_at(&db, later, &["TTL", "old"]), b":-1\r\n");
+        // 만료된 문자열 키 자리에도 리스트를 만들 수 있습니다
+        run_at(&db, start, &["SET", "s", "v", "PX", "100"]);
+        assert_eq!(run_at(&db, later, &["LPUSH", "s", "a"]), b":1\r\n");
+    }
+
+    #[test]
+    fn 리스트_커맨드의_인자_개수_에러() {
+        let wrong = |name: &str| {
+            format!("-ERR wrong number of arguments for '{name}' command\r\n").into_bytes()
+        };
+        assert_eq!(run(&["LPUSH"]), wrong("lpush"));
+        assert_eq!(run(&["LPUSH", "q"]), wrong("lpush"));
+        assert_eq!(run(&["RPUSH"]), wrong("rpush"));
+        assert_eq!(run(&["RPUSH", "q"]), wrong("rpush"));
+        assert_eq!(run(&["LPOP"]), wrong("lpop"));
+        assert_eq!(run(&["RPOP"]), wrong("rpop"));
+        assert_eq!(run(&["LLEN"]), wrong("llen"));
+        assert_eq!(run(&["LLEN", "a", "b"]), wrong("llen"));
+        assert_eq!(run(&["LRANGE"]), wrong("lrange"));
+        assert_eq!(run(&["LRANGE", "q", "0"]), wrong("lrange"));
+        assert_eq!(run(&["LRANGE", "q", "0", "1", "2"]), wrong("lrange"));
+        // 숫자보다 개수를 먼저 봅니다
+        assert_eq!(run(&["LRANGE", "q", "abc", "1", "2"]), wrong("lrange"));
+        // 에러가 난 커맨드는 키를 만들지 않습니다
+        let db = Db::default();
+        run_on(&db, &["LPUSH", "q"]);
+        assert_eq!(run_on(&db, &["EXISTS", "q"]), b":0\r\n");
+    }
+
+    #[test]
+    fn 여러_스레드가_넣고_빼도_빠지는_원소가_없다() {
+        // 넣는 스레드 4개가 500개씩 넣는 동안 빼는 스레드 4개가 같이 뺍니다.
+        // 뺀 개수와 남은 개수를 더하면 넣은 개수와 같아야 합니다.
+        let db = Db::default();
+        let popped = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..500 {
+                        run_on(&db, &["LPUSH", "q", "x"]);
+                    }
+                });
+                scope.spawn(|| {
+                    for _ in 0..500 {
+                        if run_on(&db, &["RPOP", "q"]) != b"$-1\r\n" {
+                            popped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        let left = 2000 - popped.into_inner();
+        assert_eq!(
+            run_on(&db, &["LLEN", "q"]),
+            format!(":{left}\r\n").into_bytes()
+        );
     }
 
     #[test]

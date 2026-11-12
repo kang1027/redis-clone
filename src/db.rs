@@ -1,6 +1,6 @@
 //! 모든 커넥션이 같이 쓰는 저장소입니다.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,10 +8,19 @@ use std::time::{Duration, Instant};
 /// 이 간격마다 저장소 전체를 훑어 만료된 키를 지웁니다. 진짜 Redis 기본값(hz 10)과 같은 100ms입니다.
 const ACTIVE_EXPIRE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 키 하나에 들어가는 값의 종류입니다. 경우마다 안에 들고 있는 데이터가 다릅니다.
+/// 값을 꺼내 쓰는 곳은 `match`로 모든 경우에 답해야 컴파일됩니다. 종류가 다를 때의 답이 WRONGTYPE입니다.
+pub enum Value {
+    /// 바이트 그대로 둡니다. Redis 값에는 UTF-8이 아닌 바이트도 들어옵니다.
+    Str(Vec<u8>),
+    /// 양 끝에서 넣고 빼는 줄입니다. `VecDeque`는 앞뒤 어느 쪽에서 넣고 빼도 나머지를 옮기지 않습니다.
+    /// 빈 리스트는 저장하지 않습니다. 마지막 원소를 빼는 쪽이 키도 같이 지웁니다.
+    List(VecDeque<Vec<u8>>),
+}
+
 /// 값과 만료 시각을 같이 둡니다. 키를 지우면 만료 시각도 같이 사라져서, 둘이 어긋날 일이 없습니다.
 pub struct Entry {
-    /// 바이트 그대로 둡니다. Redis 값에는 UTF-8이 아닌 바이트도 들어옵니다.
-    pub value: Vec<u8>,
+    pub value: Value,
     /// `None`이면 TTL이 없는 키입니다.
     pub expires_at: Option<Instant>,
 }
