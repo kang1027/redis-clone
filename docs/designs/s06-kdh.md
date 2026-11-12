@@ -1,7 +1,7 @@
 # S06 List — kdh
 
 - 구현 브랜치: `kdh/s06-list` (main `c8514ff` 위에서 시작, 로컬). main에 `b2f823e`로 반영했습니다
-- 걸린 시간: 약 15분 (11/12 22:11쯤 요청 → 22:25 S06 커밋). S07과 한 번에 진행했고, 주제 이해는 11/9에 만든 구현 전 설명 덱으로 먼저 했습니다
+- 걸린 시간: 약 15분 (11/12, S06 커밋 22:25). S07과 한 번에 진행했고, 주제 이해는 11/9에 만든 구현 전 설명 덱으로 먼저 했습니다
 
 ## 1. 무엇을 만들었나
 
@@ -20,7 +20,7 @@
 - 스펙: https://redis.io/docs/latest/commands/lpush/ · https://redis.io/docs/latest/commands/lpop/ · https://redis.io/docs/latest/commands/lrange/ · https://redis.io/docs/latest/commands/llen/
 - 정답지 Redis: 8.10.2
 
-**빼기로 한 것:** `LPOP`/`RPOP`의 개수 인자(`LPOP q 2`), `LINDEX`·`LSET`·`LINSERT`·`LREM`·`LTRIM` 같은 다른 리스트 커맨드, `TYPE`(S10), `OBJECT ENCODING`. 구현 전에 AI가 이 목록을 먼저 내고 확인받았습니다.
+**빼기로 한 것:** `LPOP`/`RPOP`의 개수 인자(`LPOP q 2`), `LINDEX`·`LSET`·`LINSERT`·`LREM`·`LTRIM` 같은 다른 리스트 커맨드, `TYPE`(S10), `OBJECT ENCODING`. 개수 인자와 다른 리스트 커맨드를 빼는 것은 구현 전에 AI가 먼저 말하고 확인받았습니다. `TYPE`과 `OBJECT ENCODING`은 로드맵의 6개에 없어서 AI가 뺐습니다.
 
 ## 2. 설계 선택
 
@@ -29,7 +29,7 @@
 | 리스트를 무엇으로 만들지 (토론 주제) | `VecDeque<Vec<u8>>` | `LPUSH`/`LPOP`은 앞, `RPUSH`/`RPOP`은 뒤라서 양 끝을 다 씁니다. `VecDeque`는 앞뒤 넣고 빼기와 i번째 접근이 다 빠릅니다. 표준 라이브러리라 의존성도 아닙니다 | **`Vec`**: 새로 배울 건 없지만 한쪽 끝은 넣고 뺄 때마다 나머지를 전부 옮깁니다. 작업 큐는 `LPUSH` + `RPOP`이라 반드시 그 느린 쪽을 씁니다. **직접 만든 연결 리스트**: 한 칸을 앞뒤 이웃이 같이 가리켜야 해서 `Rc<RefCell>`이 필요하고(`unsafe` 금지), `LRANGE q 5000 5010`이 5000칸을 따라갑니다 |
 | 값 타입을 어떻게 나눌지 | `enum Value { Str(Vec<u8>), List(VecDeque<Vec<u8>>) }`를 `Entry.value`에 둠 | 로드맵이 말한 모양입니다. 만료 시각은 `Entry`에 그대로 있어서 S04의 TTL 코드를 한 줄도 안 고쳤습니다 | 타입마다 맵을 따로 두기: 같은 키가 두 맵에 동시에 있을 수 있게 되고, `DEL`/`EXPIRE`가 맵마다 봐야 합니다 |
 | WRONGTYPE을 어디서 판정할지 | `as_string`, `as_list` helper 두 개가 `match`로 판정 | 값 종류가 늘면(S08 Hash) 이 두 `match`가 컴파일 에러를 내서 빠뜨릴 수가 없습니다. 커맨드 갈래에는 `as_list(&mut entry.value)?` 한 줄만 남습니다 | 커맨드마다 `match`: 같은 코드가 6번 나옵니다 |
-| `execute`의 실패 | `Result<Vec<u8>, CommandError>`로 바꿈 (리팩터링 커밋 `4eadb6e`를 따로 둠) | S05 문서에 "WRONGTYPE을 내는 커맨드가 여러 개가 되면 바꾼다"고 적어 둔 조건이 왔습니다. 각 갈래에서 `?`로 빠져나갑니다 | S05 방식(helper만 `Result`): helper가 커맨드마다 하나씩 필요해집니다 |
+| `execute`의 실패 | `Result<Vec<u8>, CommandError>`로 바꿈 (브랜치에서는 리팩터링 커밋을 따로 뒀고, main에는 S06 squash 커밋에 같이 들어갔습니다) | S05 문서에 "WRONGTYPE을 내는 커맨드가 여러 개가 되면 바꾼다"고 적어 둔 조건이 왔습니다. 각 갈래에서 `?`로 빠져나갑니다 | S05 방식(helper만 `Result`): helper가 커맨드마다 하나씩 필요해집니다 |
 | `LPUSH`와 `RPUSH`를 어떻게 만들지 | `Command::Push { end }`, `Command::Pop { end }`로 묶고 `enum End { Left, Right }`로 구분 | 다른 건 `push_front`냐 `push_back`이냐 한 줄뿐입니다 | 커맨드마다 갈래: 같은 코드가 두 번씩 나옵니다 |
 | `LRANGE` 번호를 언제 볼지 | 정수인지는 `parse`에서, 범위 계산은 `execute`에서 | 정답지도 인자 에러가 타입 에러보다 먼저입니다(`LRANGE 문자열키 abc 1` → not an integer). 범위는 길이를 알아야 계산됩니다 | 전부 `execute`에서: 락을 잡은 채로 인자 에러가 납니다 |
 | `LPOP q 2`를 어떻게 답할지 | 인자 개수 에러 | 개수 인자는 이번 범위가 아닙니다. S04에서 `SET`의 모르는 옵션을 syntax error로 보낸 것과 같은 처리입니다 | 조용히 무시하고 하나만 빼기: 틀린 응답 모양(`$`)을 정상처럼 보냅니다 |
